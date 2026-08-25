@@ -37,8 +37,12 @@
 use crate::doc::{Doc, Kind, Span, Style};
 use crate::text::{Face, Text, CODE_LEADING};
 
-/// Longest a line of prose may get, in pixels at the base size.
-pub const MEASURE: f32 = 736.0;
+/// Longest a line of prose may get, in pixels.
+///
+/// Derived from a character count at layout time rather than being this
+/// constant: see [`crate::text::MEASURE_CHARS`]. Kept as a floor so a very small
+/// window still has a sane column.
+pub const MEASURE_MIN: f32 = 320.0;
 
 /// Space either side of the text column.
 pub const PAD: f32 = 28.0;
@@ -137,6 +141,9 @@ fn face_of(kind: &Kind, style: &Style) -> Face {
         || matches!(kind, Kind::TableRow { header: true, .. })
     {
         Face::SansBold
+    } else if style.italic {
+        // A real face, so `Run::italic` no longer has to ask for a shear.
+        Face::SansItalic
     } else {
         Face::Sans
     }
@@ -215,7 +222,10 @@ pub fn lay_out(
     let mut out = Laid::default();
     // Centred when the window is wider than the measure, so growing the window
     // gives margins rather than longer lines.
-    let column = (width - PAD * 2.0).min(MEASURE);
+    // The measure is a number of CHARACTERS, converted here. A pixel constant
+    // silently becomes the wrong measure the moment the face or size changes.
+    let measure = text.measure_width(base).max(MEASURE_MIN);
+    let column = (width - PAD * 2.0).min(measure);
     let left = ((width - column) / 2.0).max(PAD);
     let mut y = PAD;
     let mut prev: Option<Kind> = None;
@@ -264,7 +274,13 @@ pub fn lay_out(
             }
             let rows = &doc.blocks[i..j];
             let reveal_rel = reveal.and_then(|r| (r >= i && r < j).then_some(r - i));
-            y = lay_table(&mut out, text, editing, rows, reveal_rel, x0, y, avail, base);
+            // A table is not prose, so the MEASURE does not apply to it. The
+            // measure exists so the eye can find the next line of a paragraph;
+            // a table is read cell by cell and constraining it to the prose
+            // column just wraps every heading onto two lines.
+            let table_width = (width - PAD * 2.0 - indent).max(avail);
+            let table_x = if table_width > avail { PAD + indent } else { x0 };
+            y = lay_table(&mut out, text, editing, rows, reveal_rel, table_x, y, table_width, base);
             done_to = j;
             prev = Some(block.kind.clone());
             prev_source_end = doc.blocks[j - 1].source.end;
@@ -576,6 +592,8 @@ fn lay_table(
                     Face::Mono
                 } else if span.style.bold {
                     Face::SansBold
+                } else if span.style.italic {
+                    Face::SansItalic
                 } else {
                     face
                 };
@@ -736,7 +754,8 @@ mod tests {
             extent(&narrow),
             extent(&huge)
         );
-        assert!(extent(&huge) <= MEASURE, "extent {} exceeds MEASURE", extent(&huge));
+        let cap = Text::new().measure_width(16.0);
+        assert!(extent(&huge) <= cap, "extent {} exceeds the measure {cap}", extent(&huge));
     }
 
     #[test]
@@ -927,6 +946,50 @@ mod tests {
         for word in ["One", "three", "four"] {
             assert!(all.contains(word), "{word} went missing; got {all:?}");
         }
+    }
+
+    #[test]
+    fn a_laid_out_paragraph_holds_a_readable_number_of_characters() {
+        // The property, measured on text rather than asserted about a constant.
+        // Sized by the advance of a single glyph the column came out at 89
+        // characters -- past the band where the eye reliably finds the next line.
+        let prose = "the quick brown fox jumps over the lazy dog and keeps on running \
+                     across the field toward the river where it stops to drink ";
+        let src = prose.repeat(6);
+        let t = Text::new();
+        let l = lay_out(&parse(&src), 1600.0, crate::text::BODY_PX, &t, None);
+
+        use std::collections::BTreeMap;
+        let mut lines: BTreeMap<i64, usize> = BTreeMap::new();
+        for r in &l.runs {
+            *lines.entry((r.baseline * 10.0) as i64).or_default() += r.text.chars().count();
+        }
+        let mut lens: Vec<usize> = lines.values().copied().collect();
+        assert!(lens.len() > 4, "expected several lines, got {}", lens.len());
+        lens.sort_unstable();
+        // The last line of a paragraph is short by definition, so the check is on
+        // the full ones.
+        let longest = *lens.last().expect("a line");
+        assert!(
+            (45..=80).contains(&longest),
+            "longest line is {longest} characters, outside the readable band"
+        );
+    }
+
+    #[test]
+    fn a_very_wide_window_does_not_lengthen_the_line() {
+        let src = "the quick brown fox jumps over the lazy dog ".repeat(20);
+        let t = Text::new();
+        let chars_at = |w: f32| {
+            let l = lay_out(&parse(&src), w, crate::text::BODY_PX, &t, None);
+            use std::collections::BTreeMap;
+            let mut lines: BTreeMap<i64, usize> = BTreeMap::new();
+            for r in &l.runs {
+                *lines.entry((r.baseline * 10.0) as i64).or_default() += r.text.chars().count();
+            }
+            lines.values().copied().max().unwrap_or(0)
+        };
+        assert_eq!(chars_at(1000.0), chars_at(3000.0), "the line grew with the window");
     }
 
     // ---- tables --------------------------------------------------------------

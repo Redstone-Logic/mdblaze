@@ -46,6 +46,9 @@ Speed decides the architecture rather than being tuned for afterwards.
 ## Use
 
 ```sh
+mdedit --install-handler     # open .md by double-click
+mdedit --uninstall-handler   # and give the association back
+
 mdedit README.md             # read it
 mdedit --edit README.md      # open straight into editing
 mdedit --timing file.md      # and say where the time went
@@ -55,6 +58,11 @@ mdedit --shot out.ppm f.md   # render one frame with no window at all
 The document is always rendered. The block your caret is in shows its markdown
 so you can change it, and the moment the caret leaves, that block renders again.
 No mode to switch, no second pane: what you edit is what you are looking at.
+
+`--install-handler` writes a `.desktop` entry and makes it the default for
+`text/markdown` and `text/x-markdown`. It records whatever it displaced and
+`--uninstall-handler` puts that back: a tool that seizes a file association and
+cannot give it back is one people are right to be wary of.
 
 Click to put the caret where you clicked -- including in a block that is still
 rendered, which reveals it. Arrow keys move the caret, the wheel and
@@ -82,17 +90,26 @@ is why runs carry provenance rather than just text -- the rendered text is not
 the source, since `**bold**` renders as `bold`, so the mapping cannot be
 arithmetic on what is displayed.
 
+Closing with unsaved changes is refused once, on every route out -- Escape, the
+title bar's close button, the window manager. A guard that only covers the way
+you thought of is not a guard.
+
 Saving is a temp sibling plus a rename. `fs::write` truncates first, so a crash
 or a full disk between the truncate and the write leaves the truncated file --
 at the exact moment someone asked for their work to be kept.
 
 ## Limits, stated
 
-- **DejaVu, whatever you have installed**, and no coverage for scripts the
+- **Noto Sans, whatever you have installed.** No coverage for scripts the
   embedded faces lack -- CJK, Arabic, Devanagari render as missing glyphs. The
   fix is to embed more coverage, not to start asking the system.
-- **Synthetic italics.** Sheared from the regular face rather than a true italic,
-  because `fonts-dejavu-core` ships no oblique sans.
+- **No settings, by choice.** The size, the measure and the leading are decided
+  rather than exposed: a document reader that asks people to configure their
+  typography has failed at the one job it has. 19px, about 66 characters a line,
+  1.55 leading -- the middle of the band typographic practice settled on.
+- **The handler is Linux only.** `.desktop` files are a freedesktop convention;
+  macOS declares document types in an app bundle and Windows in the registry.
+
 - **Tables do not scroll sideways.** A table with many columns is scaled down
   until a minimum width, then overflows the measure rather than shrinking a
   column to nothing -- a column of no width shows nothing, which is worse than

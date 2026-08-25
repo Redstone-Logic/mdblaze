@@ -257,15 +257,18 @@ mod tests {
 
     #[test]
     fn the_status_line_says_when_a_file_is_modified() {
+        // Compares the two renders rather than counting pixels of an exact
+        // colour: text is anti-aliased, so whether ANY pixel reaches full
+        // coverage depends on the face, and the first version of this test broke
+        // when the font changed without the behaviour changing at all.
         let (w, h) = (700usize, 120usize);
-        let ink = |dirty: bool| {
+        let render = |dirty: bool| {
             let mut text = Text::new();
             let mut buf = vec![0u32; w * h];
             draw_status(&mut text, &mut buf, w, h, 16.0, &Theme::DARK, "notes.md", dirty, None);
-            buf.iter().filter(|p| **p == Theme::DARK.caret).count()
+            buf
         };
-        assert_eq!(ink(false), 0, "an unmodified file claimed to be modified");
-        assert!(ink(true) > 0, "a modified file said nothing");
+        assert_ne!(render(true), render(false), "a modified file said nothing");
     }
 
     #[test]
@@ -289,26 +292,22 @@ mod tests {
     }
 
     #[test]
-    fn italics_lean_right_of_upright() {
-        // The shear is applied per row, so the rightmost inked pixel of a sheared
-        // glyph sits further right than the same glyph upright.
-        let w = 400usize;
-        let rightmost = |italic: bool| {
-            let mut text = Text::new();
-            let mut laid = lay_out(&parse("MMMM"), w as f32, 40.0, &text, None);
-            for r in laid.runs.iter_mut() {
-                r.italic = italic;
-            }
-            let mut buf = vec![0u32; w * 200];
-            draw(&laid, &mut text, &mut buf, w, 200, 0.0, &Theme::DARK);
-            buf.iter()
-                .enumerate()
-                .filter(|(_, p)| **p != Theme::DARK.bg)
-                .map(|(i, _)| i % w)
-                .max()
-                .unwrap_or(0)
-        };
-        assert!(rightmost(true) > rightmost(false), "shear had no effect");
+    fn italic_text_is_drawn_with_the_italic_face() {
+        // Was: "a sheared glyph reaches further right". A real italic face is
+        // compiled in now, so the shear is zero and that test asserted the old
+        // mechanism rather than the behaviour. What matters is that emphasis
+        // reaches a different face at all -- otherwise it silently disappears.
+        let src = "plain *emphasised* plain";
+        let t = Text::new();
+        let l = lay_out(&parse(src), 800.0, 19.0, &t, None);
+        let em = l
+            .runs
+            .iter()
+            .find(|r| r.text.trim() == "emphasised")
+            .expect("the emphasised run");
+        assert_eq!(em.face, crate::text::Face::SansItalic);
+        let plain = l.runs.iter().find(|r| r.text.trim() == "plain").expect("plain");
+        assert_eq!(plain.face, crate::text::Face::Sans);
     }
 }
 

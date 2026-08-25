@@ -31,6 +31,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use mdedit::desktop;
 use mdedit::doc;
 use mdedit::edit::Buffer;
 use mdedit::file;
@@ -50,7 +51,7 @@ const LINE_SCROLL: f32 = 48.0;
 /// How long a status message stays up before the hint returns.
 const NOTE_MS: u128 = 2_500;
 
-const BASE: f32 = 16.0;
+const BASE: f32 = mdedit::text::BODY_PX;
 
 struct App {
     t0: Instant,
@@ -117,12 +118,28 @@ impl App {
         match file::save_atomic(&path, &self.buffer.text()) {
             Ok(()) => {
                 self.buffer.mark_saved();
+                self.confirm_discard = false;
                 self.say("saved");
             }
             // Never silent. A save that failed and said nothing is how work is
             // lost while someone believes it is safe.
             Err(e) => self.say(&format!("could not save: {e}")),
         }
+    }
+
+    /// Whether it is safe to close, and say so if it is not.
+    ///
+    /// The guard is on the ACTION, not on one key, because there are several ways
+    /// out of a window -- Escape, the title bar's close button, the window
+    /// manager -- and a guard that only covers the one you thought of is not a
+    /// guard. It is a promise that fails on the path nobody tested.
+    fn may_close(&mut self) -> bool {
+        if !self.buffer.is_dirty() || self.confirm_discard {
+            return true;
+        }
+        self.confirm_discard = true;
+        self.say("unsaved changes — Ctrl+S to save, or close again to discard");
+        false
     }
 
     fn viewport(&self, height: f32) -> f32 {
@@ -166,7 +183,17 @@ impl ApplicationHandler for App {
             return;
         };
         match ev {
-            WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::CloseRequested => {
+                // The title bar's close button went straight out, so a document
+                // with unsaved changes could be lost by clicking the one control
+                // every window has. Escape was guarded and this was not, which is
+                // the worse half to miss.
+                if self.may_close() {
+                    el.exit();
+                } else {
+                    window.request_redraw();
+                }
+            }
             WindowEvent::ModifiersChanged(m) => self.mods = m,
 
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
@@ -202,12 +229,7 @@ impl ApplicationHandler for App {
                     Key::Character(_) if ctrl => touched = false,
 
                     Key::Named(NamedKey::Escape) => {
-                        // Unsaved work is not discarded on one keypress. The
-                        // second press is the person saying they meant it.
-                        if self.buffer.is_dirty() && !self.confirm_discard {
-                            self.confirm_discard = true;
-                            self.say("unsaved — Ctrl+S to save, Esc again to discard");
-                        } else {
+                        if self.may_close() {
                             el.exit();
                         }
                         touched = false;
@@ -350,6 +372,21 @@ impl ApplicationHandler for App {
     }
 }
 
+/// Print what an install or uninstall did, or why it did not.
+fn report(r: std::io::Result<Vec<String>>) {
+    match r {
+        Ok(lines) => {
+            for l in lines {
+                println!("  {l}");
+            }
+        }
+        Err(e) => {
+            eprintln!("mdedit: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
     let t0 = Instant::now();
     let mut path: Option<std::path::PathBuf> = None;
@@ -375,8 +412,24 @@ fn main() {
             // Where to put the caret for a shot, as a byte offset. What makes the
             // live-reveal visible in a still image.
             "--at" => shot_cursor = args.next().and_then(|v| v.parse().ok()),
+            // Register as the handler for markdown, so double-clicking a .md
+            // opens this. Separated from opening a file because it changes the
+            // machine rather than the document, and because taking over a file
+            // type should be something a person asked for by name.
+            "--install-handler" => {
+                report(desktop::install());
+                return;
+            }
+            "--uninstall-handler" => {
+                report(desktop::uninstall());
+                return;
+            }
             "-h" | "--help" => {
-                println!("mdedit [--timing] [--once] [--shot out.ppm [--at BYTE]] <file.md>");
+                println!(
+                    "mdedit [--timing] [--once] [--shot out.ppm [--at BYTE]] <file.md>\n\
+                     mdedit --install-handler     open .md files by double-click\n\
+                     mdedit --uninstall-handler   and give the association back"
+                );
                 return;
             }
             other if want_shot && shot_to.is_none() => {

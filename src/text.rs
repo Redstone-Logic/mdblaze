@@ -29,13 +29,18 @@
 //! actually drawn. A document uses a few hundred distinct glyphs, so the work is
 //! proportional to what is on screen rather than to what the face contains.
 //!
-//! # Synthetic italics
+//! # Which faces, and why these
 //!
-//! DejaVu ships an oblique sans face; the `fonts-dejavu-core` package does not
-//! include it, so shipping italics would mean vendoring a fourth file. Instead
-//! italics are sheared from the regular face at blit time -- a horizontal offset
-//! proportional to height, which is what an oblique face largely is. It is not
-//! a true italic (no redrawn letterforms) and at small sizes nobody can tell.
+//! Noto Sans, not DejaVu. There are no user-settable options here on purpose --
+//! a document reader that asks people to configure their typography has failed
+//! at the one job it has -- so the choice has to be defensible rather than
+//! merely available. Noto has a larger x-height and more open apertures, which
+//! is what makes text easier at a given size, and it is under the SIL Open Font
+//! Licence so it can be compiled in.
+//!
+//! A real italic is vendored rather than sheared. Synthetic obliques slant the
+//! upright letterforms; a true italic redraws them, and it is the difference
+//! between emphasis that reads and emphasis that looks like a rendering fault.
 
 use ab_glyph::{Font as _, FontRef, PxScale, ScaleFont as _};
 use std::collections::HashMap;
@@ -45,12 +50,31 @@ use std::collections::HashMap;
 pub enum Face {
     Sans,
     SansBold,
+    SansItalic,
     Mono,
 }
 
-/// Rise over run for synthetic italics. 0.21 is close to the angle DejaVu's own
-/// oblique uses.
-pub const SHEAR: f32 = 0.21;
+/// Kept at zero: a real italic face is compiled in, so nothing is sheared.
+///
+/// The constant remains because the renderer still honours it, and a face
+/// without an italic would want it again rather than losing emphasis entirely.
+pub const SHEAR: f32 = 0.0;
+
+/// Body size, in pixels.
+///
+/// Curated, not configurable. 16px is a browser default chosen for dense pages
+/// of mixed content; a window whose entire job is one document being read can
+/// afford more, and long-form reading is measurably easier with it.
+pub const BODY_PX: f32 = 19.0;
+
+/// How many characters a line of prose should hold.
+///
+/// The measure is set from this rather than from a pixel width, so it stays
+/// right if the face or the size changes -- a pixel constant silently becomes
+/// the wrong number of characters the moment either does. 66 is the middle of
+/// the 45-75 band that typographic practice has settled on: much shorter and the
+/// eye returns too often, much longer and it loses the line on the way back.
+pub const MEASURE_CHARS: f32 = 66.0;
 
 /// Leading for prose, as a multiple of the type size.
 ///
@@ -59,15 +83,16 @@ pub const SHEAR: f32 = 0.21;
 /// line gap of zero -- so the "natural" line height at 16px is exactly 16px, and
 /// consecutive lines touch. A test asserting a line is taller than the type on it
 /// is what caught it; on screen it reads as a wall of text.
-pub const LEADING: f32 = 1.45;
+pub const LEADING: f32 = 1.55;
 
 /// Leading for code. Tighter, because a code block is a shape as much as it is
 /// text and loose lines break the block up.
 pub const CODE_LEADING: f32 = 1.25;
 
-const SANS: &[u8] = include_bytes!("../assets/fonts/DejaVuSans.ttf");
-const SANS_BOLD: &[u8] = include_bytes!("../assets/fonts/DejaVuSans-Bold.ttf");
-const MONO: &[u8] = include_bytes!("../assets/fonts/DejaVuSansMono.ttf");
+const SANS: &[u8] = include_bytes!("../assets/fonts/NotoSans-Regular.ttf");
+const SANS_BOLD: &[u8] = include_bytes!("../assets/fonts/NotoSans-Bold.ttf");
+const SANS_ITALIC: &[u8] = include_bytes!("../assets/fonts/NotoSans-Italic.ttf");
+const MONO: &[u8] = include_bytes!("../assets/fonts/NotoSansMono-Regular.ttf");
 
 /// A rasterised glyph: coverage values, and where to put them.
 pub struct Glyph {
@@ -94,6 +119,7 @@ struct Key {
 pub struct Text {
     sans: FontRef<'static>,
     sans_bold: FontRef<'static>,
+    sans_italic: FontRef<'static>,
     mono: FontRef<'static>,
     cache: HashMap<Key, Glyph>,
 }
@@ -105,6 +131,7 @@ impl Text {
         Text {
             sans: FontRef::try_from_slice(SANS).expect("embedded sans is valid"),
             sans_bold: FontRef::try_from_slice(SANS_BOLD).expect("embedded bold is valid"),
+            sans_italic: FontRef::try_from_slice(SANS_ITALIC).expect("embedded italic is valid"),
             mono: FontRef::try_from_slice(MONO).expect("embedded mono is valid"),
             cache: HashMap::new(),
         }
@@ -114,6 +141,7 @@ impl Text {
         match face {
             Face::Sans => &self.sans,
             Face::SansBold => &self.sans_bold,
+            Face::SansItalic => &self.sans_italic,
             Face::Mono => &self.mono,
         }
     }
@@ -192,6 +220,20 @@ impl Text {
         self.font(face).as_scaled(PxScale::from(px)).ascent()
     }
 
+    /// How wide [`MEASURE_CHARS`] characters of ordinary prose are.
+    ///
+    /// Measured against a representative sentence rather than one glyph. The
+    /// first version used the advance of `n`, which is a reasonable unit for type
+    /// but a poor model of English: real text is full of spaces, `i`, `l` and
+    /// `t`, so a column sized by `n` came out at 89 characters where 66 were
+    /// asked for. A pangram with its spaces gives the average that actually
+    /// occurs.
+    pub fn measure_width(&self, px: f32) -> f32 {
+        const SAMPLE: &str = "the quick brown fox jumps over the lazy dog ";
+        let avg = self.width(Face::Sans, SAMPLE, px) / SAMPLE.chars().count() as f32;
+        avg * MEASURE_CHARS
+    }
+
     /// How many glyphs are held. Exposed so a test can prove the cache is one.
     pub fn cached(&self) -> usize {
         self.cache.len()
@@ -213,7 +255,7 @@ mod tests {
         // If this fails the binary shipped a broken font and every document is
         // blank, which is worth failing loudly and early for.
         let t = Text::new();
-        for f in [Face::Sans, Face::SansBold, Face::Mono] {
+        for f in [Face::Sans, Face::SansBold, Face::SansItalic, Face::Mono] {
             assert!(t.advance(f, 'M', 16.0) > 0.0, "{f:?} has no advance for M");
         }
     }
@@ -281,6 +323,35 @@ mod tests {
         let lh = t.line_height(Face::Sans, 16.0);
         assert!(lh > 16.0 * 1.2, "no leading: line height {lh} at 16px");
         assert!(t.ascent(Face::Sans, 16.0) > 0.0);
+    }
+
+    #[test]
+    fn the_italic_is_a_real_face_not_the_regular_one_twice() {
+        // A synthetic oblique slants the upright letterforms; a true italic
+        // redraws them. If this ever loads the same bytes twice, emphasis
+        // silently stops being visible at all.
+        let t = Text::new();
+        let s = "affine quiz";
+        assert!(
+            (t.width(Face::SansItalic, s, 19.0) - t.width(Face::Sans, s, 19.0)).abs() > 0.1,
+            "the italic face measures identically to the regular one"
+        );
+    }
+
+    #[test]
+    fn the_measure_holds_about_sixty_six_characters_of_real_prose() {
+        // Against ORDINARY TEXT, not one glyph. Sized by the advance of `n` the
+        // column came out at 89 characters -- well outside the readable band --
+        // because English is not made of `n`s.
+        let t = Text::new();
+        let width = t.measure_width(BODY_PX);
+        let sample = "the quick brown fox jumps over the lazy dog ".repeat(4);
+        let per_char = t.width(Face::Sans, &sample, BODY_PX) / sample.chars().count() as f32;
+        let chars = width / per_char;
+        assert!(
+            (chars - MEASURE_CHARS).abs() < 1.0,
+            "the measure holds {chars} characters, wanted {MEASURE_CHARS}"
+        );
     }
 
     #[test]
