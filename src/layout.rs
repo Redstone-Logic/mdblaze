@@ -51,6 +51,16 @@ pub const PAD: f32 = 28.0;
 /// Indentation per nesting level.
 pub const INDENT: f32 = 22.0;
 
+/// How many monospace columns a code block may use.
+///
+/// 79, which is PEP 8's limit and the width most code is written to -- it comes
+/// from an 80-column terminal leaving room for the newline. Prose and code want
+/// DIFFERENT measures and it is a mistake to give them one: prose is swept line
+/// by line and wants about 66 characters, code is read structurally and wants to
+/// show the line the author actually wrote. Holding code to the prose measure
+/// clipped it at 66 columns.
+pub const CODE_COLUMNS: f32 = 79.0;
+
 /// What a run is for. The renderer turns these into colours; layout does not
 /// know or care what they look like.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,11 +240,23 @@ pub fn lay_out(
     let mut out = Laid::default();
     // Centred when the window is wider than the measure, so growing the window
     // gives margins rather than longer lines.
-    // The measure is a number of CHARACTERS, converted here. A pixel constant
-    // silently becomes the wrong measure the moment the face or size changes.
+    // ONE content column, and everything starts at its left edge.
+    //
+    // Prose, code, tables and diagrams all want different WIDTHS -- 66 characters
+    // of prose, 79 columns of code, whatever a table's cells need. What they must
+    // share is where they BEGIN. Sizing each one independently and centring it
+    // gives a page whose left edge moves from block to block, which reads as a
+    // fault however defensible each individual width is.
+    //
+    // So the column is as wide as the widest thing in it (code), the page centres
+    // THAT, and every block is laid out from its left edge.
     let measure = text.measure_width(base).max(MEASURE_MIN);
-    let column = (width - PAD * 2.0).min(measure);
-    let left = ((width - column) / 2.0).max(PAD);
+    let code_measure = text.advance(Face::Mono, 'M', base * 0.92) * CODE_COLUMNS + base;
+    let content = (width - PAD * 2.0).min(measure.max(code_measure));
+    let left = ((width - content) / 2.0).max(PAD);
+    // Prose still wraps at its own, narrower measure -- it just starts in the
+    // same place as everything else.
+    let column = content.min(measure);
     let mut y = PAD;
     let mut prev: Option<Kind> = None;
 
@@ -282,13 +304,19 @@ pub fn lay_out(
             }
             let rows = &doc.blocks[i..j];
             let reveal_rel = reveal.and_then(|r| (r >= i && r < j).then_some(r - i));
-            // A table is not prose, so the MEASURE does not apply to it. The
-            // measure exists so the eye can find the next line of a paragraph;
-            // a table is read cell by cell and constraining it to the prose
-            // column just wraps every heading onto two lines.
-            let table_width = (width - PAD * 2.0 - indent).max(avail);
-            let table_x = if table_width > avail { PAD + indent } else { x0 };
-            y = lay_table(&mut out, text, editing, rows, reveal_rel, table_x, y, table_width, base);
+            // A table is not prose, so the MEASURE does not apply -- it is read
+            // cell by cell rather than swept line by line, and holding it to the
+            // prose column wraps every heading onto two lines.
+            //
+            // But it is still part of the document, so it is CENTRED on the same
+            // axis as the text rather than pinned left. Pinned, a narrow table
+            // sits alone at the window's edge with the prose it belongs to
+            // several inches away.
+            // Sized to its cells -- stretching columns to fill puts a gulf
+            // between a label and its value -- but starting at the shared left
+            // edge like everything else.
+            let room = (content - indent).max(avail);
+            y = lay_table(&mut out, text, editing, rows, reveal_rel, x0, y, room, base);
             done_to = j;
             prev = Some(block.kind.clone());
             prev_source_end = doc.blocks[j - 1].source.end;
@@ -326,17 +354,22 @@ pub fn lay_out(
                 };
                 let lines: Vec<&str> = drawn.trim_end().split('\n').collect();
                 let pad = base * 0.5;
+                // A diagram is not prose either. Its ground is sized to the
+                // WIDEST LINE and centred on the text, so it neither overflows
+                // its own background nor sits pinned at the window's edge.
+                let ground_w = (content - indent).max(120.0);
+                let gx = left + indent;
                 out.shapes.push(Shape {
-                    x: x0,
+                    x: gx,
                     y,
-                    w: avail,
+                    w: ground_w,
                     h: lh * lines.len() as f32 + pad * 2.0,
                     ink: Ink::Code,
                 });
                 y += pad;
                 for line in lines {
                     out.runs.push(Run {
-                        x: x0 + pad,
+                        x: gx + pad,
                         baseline: y + asc,
                         text: line.to_string(),
                         face,
@@ -358,10 +391,22 @@ pub fn lay_out(
                 let body: String = block.spans.iter().map(|s| s.text.as_str()).collect();
                 let lines: Vec<&str> = body.split('\n').collect();
                 let pad = base * 0.5;
+                // Code gets its OWN measure -- CODE_COLUMNS of monospace -- and is
+                // centred on the same axis as the prose. Held to the prose measure
+                // it was clipped at 66 columns, well inside what code is written
+                // to. Sized to the widest line when that is narrower, so a short
+                // snippet does not sit in a wide empty box.
+                // Every code block is the same width and starts in the same
+                // place, so a page of them has one straight edge rather than a
+                // ragged one. A short snippet in a full-width box is what every
+                // renderer does and reads as deliberate; boxes of six different
+                // widths do not.
+                let ground_w = (content - indent).max(120.0);
+                let cx = left + indent;
                 out.shapes.push(Shape {
-                    x: x0,
+                    x: cx,
                     y,
-                    w: avail,
+                    w: ground_w,
                     h: lh * lines.len() as f32 + pad * 2.0,
                     ink: Ink::Code,
                 });
@@ -372,7 +417,7 @@ pub fn lay_out(
                 // fence produces one plain run, exactly as before.
                 let known = lang.as_deref().and_then(code::lang_for);
                 for line in lines {
-                    let mut pen = x0 + pad;
+                    let mut pen = cx + pad;
                     let pieces: Vec<(usize, usize, Tok)> = match known {
                         Some(l) => code::highlight(l, line),
                         None => vec![(0, line.len(), Tok::Plain)],
@@ -624,7 +669,11 @@ fn lay_table(
                 .iter()
                 .map(|s| text.width(if s.style.code { Face::Mono } else { face }, &s.text, px))
                 .sum();
-            widths[n] = widths[n].max(w + cell_pad * 2.0);
+            // Plus a pixel of slack. Without it the natural width equals the
+            // content width EXACTLY, and accumulated float error in the placement
+            // trips the wrap test -- so a heading that fits by construction wraps
+            // onto two lines anyway.
+            widths[n] = widths[n].max(w + cell_pad * 2.0 + 1.0);
         }
     }
 
@@ -639,6 +688,7 @@ fn lay_table(
             *w = (*w * scale).max(min);
         }
     }
+
 
     for (n, row) in rows.iter().enumerate() {
         if Some(n) == reveal_rel {
@@ -1217,6 +1267,117 @@ mod tests {
         let quiet = run_of(&l, "quiet").expect("the plain cell");
         assert_eq!(loud.face, Face::SansBold, "bold in a cell was lost");
         assert_eq!(quiet.face, Face::Sans);
+    }
+
+    #[test]
+    fn code_gets_more_columns_than_prose_gets_characters() {
+        // Prose and code want different measures. Held to the prose measure, a
+        // line of code was clipped at 66 columns -- well inside the 79 that code
+        // is actually written to.
+        let long = "x".repeat(79);
+        let src = format!("```\n{long}\n```\n");
+        let t = Text::new();
+        let l = lay_out(&parse(&src), 1000.0, crate::text::BODY_PX, &t, None);
+        let run = l.runs.first().expect("a code run");
+        let w = t.width(run.face, &run.text, run.px);
+        assert!(
+            w > t.measure_width(crate::text::BODY_PX),
+            "79 columns of code ({w:.0}px) fit inside the prose measure, so the \
+             measure is not doing anything for code"
+        );
+        let ground = l.shapes.iter().find(|s| s.ink == Ink::Code).expect("a ground");
+        assert!(
+            run.x >= ground.x - 0.5 && run.x + w <= ground.x + ground.w + 0.5,
+            "the code line runs outside its own ground"
+        );
+    }
+
+    #[test]
+    fn every_kind_of_block_starts_at_the_same_left_edge() {
+        // The rule, and the thing that looked wrong when it was broken: prose,
+        // code, tables and diagrams want different WIDTHS, but they must share
+        // where they BEGIN. A left edge that moves from block to block reads as a
+        // fault however defensible each individual width is.
+        let src = "prose line\n\n\
+                   ```\ncode line\n```\n\n\
+                   | a | b |\n|---|---|\n| 1 | 2 |\n\n\
+                   ```mermaid\nflowchart TD\n  A[x] --> B[y]\n```\n";
+        let t = Text::new();
+        let l = lay_out(&parse(src), 1400.0, crate::text::BODY_PX, &t, None);
+
+        let prose = l.runs.iter().find(|r| r.text.starts_with("prose")).expect("prose").x;
+        let grounds: Vec<f32> = l.shapes.iter().filter(|s| s.ink == Ink::Code).map(|s| s.x).collect();
+        assert!(grounds.len() >= 2, "expected a code block and a diagram");
+        for g in &grounds {
+            assert!((g - prose).abs() < 1.0, "a block starts at {g}, prose at {prose}");
+        }
+        let cell = l.runs.iter().find(|r| r.text.trim() == "a").expect("a table cell").x;
+        // The first cell is inset by the cell padding, which is small and
+        // deliberate; the table's own edge is the prose edge.
+        assert!(
+            cell - prose < crate::text::BODY_PX,
+            "the table starts at {cell}, prose at {prose}"
+        );
+    }
+
+    #[test]
+    fn every_code_block_is_the_same_width() {
+        // Boxes of six different widths read as ragged; one width reads as
+        // deliberate, which is what every other renderer does.
+        let l = lay("```\nx\n```\n\n```\na much much longer line of code here\n```\n", 1200.0);
+        let ws: Vec<f32> = l.shapes.iter().filter(|s| s.ink == Ink::Code).map(|s| s.w).collect();
+        assert_eq!(ws.len(), 2);
+        assert!((ws[0] - ws[1]).abs() < 1.0, "code blocks differ in width: {ws:?}");
+    }
+
+    #[test]
+    fn a_table_heading_that_fits_by_construction_does_not_wrap() {
+        // The natural width equalled the content width exactly, so float error in
+        // the placement wrapped a heading that fits. One pixel of slack.
+        let l = lay("| stage | small file | 36 KB file |\n|---|---|---|\n| read | 1 | 2 |\n", 900.0);
+        let baselines: std::collections::BTreeSet<i64> =
+            l.runs.iter().map(|r| (r.baseline * 10.0) as i64).collect();
+        assert_eq!(baselines.len(), 2, "a header cell wrapped: {} lines", baselines.len());
+    }
+
+    #[test]
+    fn a_narrow_table_does_not_stretch_to_fill_the_window() {
+        // Stretched columns put a gulf between a label and its value, which is
+        // the one thing a table exists to keep close.
+        let src = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let t = Text::new();
+        let span = |w: f32| {
+            let l = lay_out(&parse(src), w, crate::text::BODY_PX, &t, None);
+            let xs: Vec<f32> = l.runs.iter().map(|r| r.x).collect();
+            xs.iter().fold(0.0_f32, |m, x| m.max(*x)) - xs.iter().fold(f32::MAX, |m, x| m.min(*x))
+        };
+        assert!(
+            (span(900.0) - span(1800.0)).abs() < 1.0,
+            "the table stretched with the window: {} then {}",
+            span(900.0),
+            span(1800.0)
+        );
+    }
+
+    #[test]
+    fn a_diagram_fits_inside_its_own_background() {
+        // It was drawn on a ground sized to the prose column and ran off the
+        // right of it, which reads as a rendering fault rather than a wide
+        // diagram.
+        let src = "```mermaid\nflowchart LR\n    A[Double-click] --> B[Read it] --> C[Close] --> D[Nothing resident]\n```\n";
+        let t = Text::new();
+        let l = lay_out(&parse(src), 1000.0, crate::text::BODY_PX, &t, None);
+        let ground = l.shapes.iter().find(|s| s.ink == Ink::Code).expect("a ground");
+        for r in l.runs.iter() {
+            let right = r.x + t.width(r.face, &r.text, r.px);
+            assert!(
+                r.x >= ground.x - 0.5 && right <= ground.x + ground.w + 0.5,
+                "a diagram line runs from {} to {right}, outside its ground {}..{}",
+                r.x,
+                ground.x,
+                ground.x + ground.w
+            );
+        }
     }
 
     #[test]

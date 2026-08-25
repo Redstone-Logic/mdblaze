@@ -51,6 +51,14 @@ const LINE_SCROLL: f32 = 48.0;
 /// How long a status message stays up before the hint returns.
 const NOTE_MS: u128 = 2_500;
 
+/// How long the discard bypass stays armed.
+///
+/// Short on purpose. Without a deadline the second Escape could come a minute
+/// later -- long after the warning has been forgotten -- and unsaved work would
+/// go with it. A swift second press is someone confirming; a slow one is someone
+/// who has moved on and pressed Escape for an unrelated reason.
+const DISCARD_MS: u128 = 1_500;
+
 const BASE: f32 = mdedit::text::BODY_PX;
 
 struct App {
@@ -67,8 +75,9 @@ struct App {
     /// does not carry a position -- only the move before it does.
     pointer: (f32, f32),
     note: Option<(String, Instant)>,
-    /// Set when Escape was pressed with unsaved changes. A second press closes.
-    confirm_discard: bool,
+    /// When the discard bypass was armed, if it is. It expires after
+    /// [`DISCARD_MS`], so closing unsaved work needs a SWIFT second press.
+    armed_at: Option<Instant>,
     timing: bool,
     reported: bool,
     window: Option<Arc<Window>>,
@@ -118,7 +127,7 @@ impl App {
         match file::save_atomic(&path, &self.buffer.text()) {
             Ok(()) => {
                 self.buffer.mark_saved();
-                self.confirm_discard = false;
+                self.armed_at = None;
                 self.say("saved");
             }
             // Never silent. A save that failed and said nothing is how work is
@@ -134,12 +143,20 @@ impl App {
     /// manager -- and a guard that only covers the one you thought of is not a
     /// guard. It is a promise that fails on the path nobody tested.
     fn may_close(&mut self) -> bool {
-        if !self.buffer.is_dirty() || self.confirm_discard {
+        if !self.buffer.is_dirty() {
             return true;
         }
-        self.confirm_discard = true;
-        self.say("unsaved changes — Ctrl+S to save, or close again to discard");
+        if self.armed().is_some() {
+            return true;
+        }
+        self.armed_at = Some(Instant::now());
+        self.say("UNSAVED — Ctrl+S to save, or close again now to discard");
         false
+    }
+
+    /// The arming instant, if the bypass is still live.
+    fn armed(&self) -> Option<Instant> {
+        self.armed_at.filter(|t| t.elapsed().as_millis() <= DISCARD_MS)
     }
 
     fn viewport(&self, height: f32) -> f32 {
@@ -167,7 +184,11 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         let attrs = Window::default_attributes()
             .with_title(self.title())
-            .with_inner_size(winit::dpi::LogicalSize::new(900.0, 760.0));
+            // Wide enough that a 79-column code block -- PEP 8's limit, and what
+            // most code is written to -- fits without being clipped. That needs
+            // about 683px; the rest is margin so the window is not painted into
+            // a corner. Prose still stops at its own, narrower measure.
+            .with_inner_size(winit::dpi::LogicalSize::new(940.0, 820.0));
         let w = Arc::new(el.create_window(attrs).expect("could not open a window"));
         // The window is a document from edge to edge, so the pointer says so
         // everywhere rather than changing shape over text.
@@ -283,8 +304,9 @@ impl ApplicationHandler for App {
                     self.reflow(size.width as f32);
                     self.follow_caret(size.height as f32);
                 }
+                // Any other key means they did not mean to discard after all.
                 if !escape {
-                    self.confirm_discard = false;
+                    self.armed_at = None;
                 }
                 window.request_redraw();
             }
@@ -340,8 +362,14 @@ impl ApplicationHandler for App {
                 }
                 self.scroll = self.scroll.clamp(0.0, self.max_scroll(size.height as f32));
 
-                if self.note.as_ref().is_some_and(|(_, at)| at.elapsed().as_millis() > NOTE_MS) {
+                // While armed, the message lives exactly as long as the bypass
+                // does -- so the warning being on screen and the bypass being
+                // available are the same fact, rather than two that drift apart.
+                let armed = self.armed().is_some();
+                let life = if self.armed_at.is_some() { DISCARD_MS } else { NOTE_MS };
+                if self.note.as_ref().is_some_and(|(_, at)| at.elapsed().as_millis() > life) {
                     self.note = None;
+                    self.armed_at = None;
                 }
 
                 let (width, height) = (size.width as usize, size.height as usize);
@@ -358,7 +386,7 @@ impl ApplicationHandler for App {
                 );
                 render::draw_status(
                     &mut self.text, &mut buf, width, height, BASE, &Theme::DARK, &name, dirty,
-                    note.as_deref(),
+                    note.as_deref(), armed,
                 );
                 buf.present().expect("present");
 
@@ -488,6 +516,7 @@ fn main() {
                 .unwrap_or_else(|| "untitled".into()),
             false,
             None,
+            false,
         );
         // Binary PPM: three bytes a pixel and a one-line header. No encoder, no
         // dependency, and every image tool reads it.
@@ -516,7 +545,7 @@ fn main() {
         mods: Modifiers::default(),
         pointer: (0.0, 0.0),
         note: None,
-        confirm_discard: false,
+        armed_at: None,
         timing,
         reported: false,
         window: None,

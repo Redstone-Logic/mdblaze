@@ -29,6 +29,8 @@ pub struct Theme {
     /// The status line's ground, and the caret.
     pub bar: u32,
     pub caret: u32,
+    /// The status bar while unsaved work is one keypress from being discarded.
+    pub alarm_bg: u32,
 }
 
 impl Theme {
@@ -52,6 +54,7 @@ impl Theme {
         comment: 0x0080_8080,
         bar: 0x001b_1b1b,
         caret: 0x00b6_3c35,
+        alarm_bg: 0x0053_1f1c,
     };
 
     fn of(&self, ink: Ink) -> u32 {
@@ -281,10 +284,33 @@ mod tests {
         let render = |dirty: bool| {
             let mut text = Text::new();
             let mut buf = vec![0u32; w * h];
-            draw_status(&mut text, &mut buf, w, h, 16.0, &Theme::DARK, "notes.md", dirty, None);
+            draw_status(&mut text, &mut buf, w, h, 16.0, &Theme::DARK, "notes.md", dirty, None, false);
             buf
         };
         assert_ne!(render(true), render(false), "a modified file said nothing");
+    }
+
+    #[test]
+    fn the_whole_bar_changes_colour_while_work_is_one_keypress_from_being_lost() {
+        // A line of grey text at the bottom of a window is not a warning -- it is
+        // where warnings go to be missed. The alarm has to be hard to look past.
+        let (w, h) = (700usize, 120usize);
+        let render = |alarm: bool| {
+            let mut text = Text::new();
+            let mut buf = vec![0u32; w * h];
+            draw_status(&mut text, &mut buf, w, h, 16.0, &Theme::DARK, "n.md", true, None, alarm);
+            buf
+        };
+        let calm = render(false);
+        let loud = render(true);
+        assert_ne!(calm, loud, "the alarm looked identical to the ordinary bar");
+        let alarmed = loud.iter().filter(|p| **p == Theme::DARK.alarm_bg).count();
+        assert!(alarmed > w * 10, "only {alarmed} pixels changed; that is not a warning");
+        assert_eq!(
+            calm.iter().filter(|p| **p == Theme::DARK.alarm_bg).count(),
+            0,
+            "the ordinary bar is already alarm-coloured, so the alarm says nothing"
+        );
     }
 
     #[test]
@@ -293,7 +319,7 @@ mod tests {
         let render = |note: Option<&str>| {
             let mut text = Text::new();
             let mut buf = vec![0u32; w * h];
-            draw_status(&mut text, &mut buf, w, h, 16.0, &Theme::DARK, "n.md", false, note);
+            draw_status(&mut text, &mut buf, w, h, 16.0, &Theme::DARK, "n.md", false, note, false);
             buf
         };
         assert_ne!(render(None), render(Some("saved")), "the note changed nothing");
@@ -402,23 +428,39 @@ pub fn draw_status(
     name: &str,
     dirty: bool,
     note: Option<&str>,
+    // Set while closing would discard unsaved work. The whole bar changes
+    // colour, because a line of grey text at the bottom of a window is not a
+    // warning -- it is a place warnings go to be missed.
+    alarm: bool,
 ) {
     let bh = status_height(base);
     let top = height as f32 - bh;
-    fill(buf, width, height, 0.0, top, width as f32, bh, theme.bar);
+    let ground = if alarm { theme.alarm_bg } else { theme.bar };
+    fill(buf, width, height, 0.0, top, width as f32, bh, ground);
+    if alarm {
+        // A rule along the top edge, so the bar reads as a band rather than as
+        // the window having changed colour for no reason.
+        fill(buf, width, height, 0.0, top, width as f32, 2.0, theme.caret);
+    }
 
     let px = base * 0.78;
     let baseline = top + (bh + text.ascent(Face::Sans, px)) / 2.0 - base * 0.22;
     let mut x = draw_text(
         text, buf, width, height, PAD, baseline, name, Face::SansBold, px, theme.strong,
     );
+    let hint_ink = if alarm { theme.strong } else { theme.dim };
     if dirty {
         // A word, not a symbol. "modified" needs no key and cannot be mistaken
         // for decoration the way a lone dot can.
-        x = draw_text(text, buf, width, height, x + base * 0.5, baseline, "modified", Face::Sans, px, theme.caret);
+        // On the alarm ground the accent nearly disappears into it, so the word
+        // that says WHY the bar is red has to stop being the same colour as the
+        // bar. It is the one word that must stay legible there.
+        let ink = if alarm { theme.strong } else { theme.caret };
+        x = draw_text(text, buf, width, height, x + base * 0.5, baseline, "modified", Face::Sans, px, ink);
     }
     let hint = note.unwrap_or("Ctrl+S save  ·  Ctrl+Z undo  ·  Esc close");
-    let hw = text.width(Face::Sans, hint, px);
+    let hw = text.width(if alarm { Face::SansBold } else { Face::Sans }, hint, px);
     let hx = (width as f32 - PAD - hw).max(x + base);
-    draw_text(text, buf, width, height, hx, baseline, hint, Face::Sans, px, theme.dim);
+    let hint_face = if alarm { Face::SansBold } else { Face::Sans };
+    draw_text(text, buf, width, height, hx, baseline, hint, hint_face, px, hint_ink);
 }

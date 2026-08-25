@@ -92,7 +92,9 @@ arithmetic on what is displayed.
 
 Closing with unsaved changes is refused once, on every route out -- Escape, the
 title bar's close button, the window manager. A guard that only covers the way
-you thought of is not a guard.
+you thought of is not a guard. The whole status bar turns red while the second
+press would discard, and the bypass expires after a second and a half: a swift
+second press is someone confirming, a slow one is someone who has moved on.
 
 Saving is a temp sibling plus a rename. `fs::write` truncates first, so a crash
 or a full disk between the truncate and the write leaves the truncated file --
@@ -115,6 +117,10 @@ at the exact moment someone asked for their work to be kept.
   rather than exposed: a document reader that asks people to configure their
   typography has failed at the one job it has. 19px, about 66 characters a line,
   1.55 leading -- the middle of the band typographic practice settled on.
+- **Prose and code get different measures**, because they are read differently:
+  66 characters of prose, 79 columns of code (PEP 8's limit, and what most code
+  is written to). Everything shares one left edge regardless -- blocks of
+  different widths are fine, a left edge that moves between them is not.
 - **The handler is Linux only.** `.desktop` files are a freedesktop convention;
   macOS declares document types in an app bundle and Windows in the registry.
 
