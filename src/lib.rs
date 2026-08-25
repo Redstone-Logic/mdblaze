@@ -29,6 +29,7 @@
 //! windowing lives behind its own edge and can be replaced without touching
 //! anything here.
 
+pub mod code;
 pub mod desktop;
 pub mod doc;
 pub mod edit;

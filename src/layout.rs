@@ -34,6 +34,7 @@
 //! The caret comes back in [`Laid::caret`] because only the layout knows where a
 //! byte offset ended up on screen -- it is the thing that put it there.
 
+use crate::code::{self, Tok};
 use crate::doc::{Doc, Kind, Span, Style};
 use crate::text::{Face, Text, CODE_LEADING};
 
@@ -60,6 +61,13 @@ pub enum Ink {
     Dim,
     Link,
     Code,
+    /// Inside a fenced block whose language is known. Anything else in a code
+    /// block stays `Code`, so an unknown language looks exactly as it did before
+    /// highlighting existed.
+    Keyword,
+    Str,
+    Number,
+    Comment,
 }
 
 /// A run of text on one line, ready to draw.
@@ -300,7 +308,7 @@ pub fn lay_out(
                 out.shapes.push(Shape { x: x0, y, w: avail, h: 1.0, ink: Ink::Dim });
                 y += base * 0.6;
             }
-            Kind::Code { .. } => {
+            Kind::Code { lang } => {
                 // Never wrapped. Lines that overflow are clipped by the viewport
                 // rather than folded, because folded code reads as different code.
                 let face = Face::Mono;
@@ -317,17 +325,40 @@ pub fn lay_out(
                     ink: Ink::Code,
                 });
                 y += pad;
+
+                // Highlighted per LINE rather than over the whole block, because
+                // a line is the unit that gets a baseline. An unknown or absent
+                // fence produces one plain run, exactly as before.
+                let known = lang.as_deref().and_then(code::lang_for);
                 for line in lines {
-                    out.runs.push(Run {
-                        x: x0 + pad,
-                        baseline: y + asc,
-                        text: line.to_string(),
-                        face,
-                        px,
-                        ink: Ink::Code,
-                        italic: false,
-                        source: block.source.start,
-                    });
+                    let mut pen = x0 + pad;
+                    let pieces: Vec<(usize, usize, Tok)> = match known {
+                        Some(l) => code::highlight(l, line),
+                        None => vec![(0, line.len(), Tok::Plain)],
+                    };
+                    for (a, b, tok) in pieces {
+                        let piece = &line[a..b];
+                        if piece.is_empty() {
+                            continue;
+                        }
+                        out.runs.push(Run {
+                            x: pen,
+                            baseline: y + asc,
+                            text: piece.to_string(),
+                            face,
+                            px,
+                            ink: match tok {
+                                Tok::Plain => Ink::Code,
+                                Tok::Keyword => Ink::Keyword,
+                                Tok::Str => Ink::Str,
+                                Tok::Number => Ink::Number,
+                                Tok::Comment => Ink::Comment,
+                            },
+                            italic: false,
+                            source: block.source.start,
+                        });
+                        pen += text.width(face, piece, px);
+                    }
                     y += lh;
                 }
                 y += pad;
@@ -990,6 +1021,49 @@ mod tests {
             lines.values().copied().max().unwrap_or(0)
         };
         assert_eq!(chars_at(1000.0), chars_at(3000.0), "the line grew with the window");
+    }
+
+    // ---- code ----------------------------------------------------------------
+
+    #[test]
+    fn a_fenced_block_with_a_known_language_is_coloured() {
+        let l = lay("```rust\nlet x = 42; // note\n```\n", 800.0);
+        let inks: Vec<Ink> = l.runs.iter().map(|r| r.ink).collect();
+        assert!(inks.contains(&Ink::Keyword), "no keyword: {inks:?}");
+        assert!(inks.contains(&Ink::Number), "no number: {inks:?}");
+        assert!(inks.contains(&Ink::Comment), "no comment: {inks:?}");
+    }
+
+    #[test]
+    fn an_unknown_language_looks_exactly_as_it_did_before() {
+        // Refusing to show a block, or colouring it wrongly by guessing, would
+        // make an unfamiliar language worse than no highlighting at all.
+        let l = lay("```brainfuck\n+++[->+<]\n```\n", 800.0);
+        assert!(l.runs.iter().all(|r| r.ink == Ink::Code), "guessed at an unknown language");
+    }
+
+    #[test]
+    fn a_fence_with_no_language_is_left_plain() {
+        let l = lay("```\nlet x = 42;\n```\n", 800.0);
+        assert!(l.runs.iter().all(|r| r.ink == Ink::Code));
+    }
+
+    #[test]
+    fn highlighting_does_not_lose_or_reorder_a_single_character() {
+        // The one thing a highlighter must never do is change what the code says.
+        let src = "```rust\nfn main() { let s = \"hi\"; } // done\n```\n";
+        let l = lay(src, 800.0);
+        let rebuilt: String = l.runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(rebuilt, "fn main() { let s = \"hi\"; } // done");
+    }
+
+    #[test]
+    fn coloured_pieces_are_laid_out_left_to_right_in_order() {
+        let l = lay("```rust\nlet x = 1;\n```\n", 800.0);
+        let xs: Vec<f32> = l.runs.iter().map(|r| r.x).collect();
+        for w in xs.windows(2) {
+            assert!(w[1] >= w[0], "pieces out of order: {xs:?}");
+        }
     }
 
     // ---- tables --------------------------------------------------------------

@@ -103,6 +103,10 @@ at the exact moment someone asked for their work to be kept.
 - **Noto Sans, whatever you have installed.** No coverage for scripts the
   embedded faces lack -- CJK, Arabic, Devanagari render as missing glyphs. The
   fix is to embed more coverage, not to start asking the system.
+- **Highlighting knows a short list of languages** -- Rust, JS/TS, Python, shell,
+  Go, C-family, SQL, JSON, YAML/TOML. An unknown fence is shown plain rather than
+  guessed at. It is a lexer, not a parser: it cannot tell a type from a variable,
+  and it never alters the text, only its colour.
 - **No settings, by choice.** The size, the measure and the leading are decided
   rather than exposed: a document reader that asks people to configure their
   typography has failed at the one job it has. 19px, about 66 characters a line,

@@ -22,6 +22,10 @@ pub struct Theme {
     pub link: u32,
     pub code: u32,
     pub code_bg: u32,
+    pub keyword: u32,
+    pub string: u32,
+    pub number: u32,
+    pub comment: u32,
     /// The status line's ground, and the caret.
     pub bar: u32,
     pub caret: u32,
@@ -38,6 +42,14 @@ impl Theme {
         link: 0x00c9_6a63,
         code: 0x00d6_d6d6,
         code_bg: 0x0017_1717,
+        // Enough hues to tell the four apart and no more. A code block with six
+        // colours in it is decoration; these are the distinctions that change
+        // what you understand -- what runs, what is text, what is a number, and
+        // what the machine ignores.
+        keyword: 0x00d8_8a84,
+        string: 0x008fb8_78 & 0x00ff_ffff,
+        number: 0x00d2_b078,
+        comment: 0x0080_8080,
         bar: 0x001b_1b1b,
         caret: 0x00b6_3c35,
     };
@@ -49,6 +61,10 @@ impl Theme {
             Ink::Dim => self.dim,
             Ink::Link => self.link,
             Ink::Code => self.code,
+            Ink::Keyword => self.keyword,
+            Ink::Str => self.string,
+            Ink::Number => self.number,
+            Ink::Comment => self.comment,
         }
     }
 }
