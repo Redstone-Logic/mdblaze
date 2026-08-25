@@ -18,8 +18,15 @@ softbuffer = "0.4"
 # A LAZY, zero-copy font reader. Not fontdue: that parses every glyph in the
 # face on load, which measured 36ms per face -- 95% of this program's startup,
 # paid to build outlines for glyphs no document uses. See `text.rs`.
-# exist -- see the note on fontconfig in `text.rs`.
 ab_glyph = "0.2"
+# Mermaid diagrams, rendered to Unicode box-drawing TEXT.
+#
+# Chosen over the SVG renderers for one reason: those need an SVG rasteriser, and
+# `resvg` pulls 84 crates including `fontdb` -- the font-scanning machinery this
+# program deliberately does not have, because scanning fonts costs more than
+# everything else here put together. This produces text, and text is the one
+# thing this program already knows how to draw.
+mermaid-text = "0.57"
 
 [profile.release]
 opt-level = 3

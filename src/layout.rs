@@ -308,6 +308,47 @@ pub fn lay_out(
                 out.shapes.push(Shape { x: x0, y, w: avail, h: 1.0, ink: Ink::Dim });
                 y += base * 0.6;
             }
+            // A mermaid fence is a DIAGRAM, not code. Rendered to box-drawing
+            // text, which this program already knows how to draw -- the SVG
+            // renderers would need a rasteriser, and the obvious one drags in the
+            // font scanning this program exists without.
+            Kind::Code { lang } if lang.as_deref() == Some("mermaid") => {
+                let face = Face::Mono;
+                let lh = text.line_height_with(face, px, CODE_LEADING);
+                let asc = text.ascent(face, px);
+                let body: String = block.spans.iter().map(|s| s.text.as_str()).collect();
+                // A diagram that will not parse falls back to its source. Showing
+                // nothing, or an error where a diagram should be, loses the
+                // content -- the source at least still says what was meant.
+                let (drawn, ink) = match mermaid_text::render(&body) {
+                    Ok(d) if !d.trim().is_empty() => (d, Ink::Code),
+                    _ => (body.clone(), Ink::Dim),
+                };
+                let lines: Vec<&str> = drawn.trim_end().split('\n').collect();
+                let pad = base * 0.5;
+                out.shapes.push(Shape {
+                    x: x0,
+                    y,
+                    w: avail,
+                    h: lh * lines.len() as f32 + pad * 2.0,
+                    ink: Ink::Code,
+                });
+                y += pad;
+                for line in lines {
+                    out.runs.push(Run {
+                        x: x0 + pad,
+                        baseline: y + asc,
+                        text: line.to_string(),
+                        face,
+                        px,
+                        ink,
+                        italic: false,
+                        source: block.source.start,
+                    });
+                    y += lh;
+                }
+                y += pad;
+            }
             Kind::Code { lang } => {
                 // Never wrapped. Lines that overflow are clipped by the viewport
                 // rather than folded, because folded code reads as different code.
@@ -1064,6 +1105,43 @@ mod tests {
         for w in xs.windows(2) {
             assert!(w[1] >= w[0], "pieces out of order: {xs:?}");
         }
+    }
+
+    #[test]
+    fn a_mermaid_fence_becomes_a_diagram_not_its_source() {
+        let src = "```mermaid\nflowchart TD\n    A[Start] --> B[End]\n```\n";
+        let l = lay(src, 900.0);
+        let all: String = l.runs.iter().map(|r| r.text.as_str()).collect();
+        assert!(all.contains("Start") && all.contains("End"), "labels missing: {all:?}");
+        // Box drawing, which is how you can tell it was laid out rather than
+        // echoed back.
+        assert!(
+            all.chars().any(|c| ('\u{2500}'..='\u{257f}').contains(&c)),
+            "no box-drawing characters, so nothing was drawn: {all:?}"
+        );
+        assert!(!all.contains("flowchart TD"), "the source was echoed instead");
+    }
+
+    #[test]
+    fn a_broken_diagram_falls_back_to_its_source_rather_than_vanishing() {
+        // Showing nothing, or an error where a diagram should be, loses what the
+        // author wrote. The source at least still says what was meant.
+        let src = "```mermaid\nthis is not a diagram at all @@@\n```\n";
+        let l = lay(src, 900.0);
+        let all: String = l.runs.iter().map(|r| r.text.as_str()).collect();
+        assert!(!all.trim().is_empty(), "the block disappeared");
+    }
+
+    #[test]
+    fn a_mermaid_fence_is_not_run_through_the_syntax_highlighter() {
+        let src = "```mermaid\nflowchart TD\n    A[if] --> B[let]\n```\n";
+        let l = lay(src, 900.0);
+        // `if` and `let` are keywords in several languages; in a diagram they are
+        // node labels and must not be coloured as code.
+        assert!(
+            l.runs.iter().all(|r| r.ink != Ink::Keyword),
+            "a diagram label was highlighted as a keyword"
+        );
     }
 
     // ---- tables --------------------------------------------------------------

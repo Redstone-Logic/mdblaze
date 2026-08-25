@@ -103,6 +103,10 @@ at the exact moment someone asked for their work to be kept.
 - **Noto Sans, whatever you have installed.** No coverage for scripts the
   embedded faces lack -- CJK, Arabic, Devanagari render as missing glyphs. The
   fix is to embed more coverage, not to start asking the system.
+- **Mermaid diagrams render as box drawing**, not as pictures. The SVG renderers
+  need a rasteriser, and the obvious one pulls 84 crates including `fontdb` --
+  the font scanning this program exists without. A diagram that will not parse
+  falls back to its source rather than vanishing.
 - **Highlighting knows a short list of languages** -- Rust, JS/TS, Python, shell,
   Go, C-family, SQL, JSON, YAML/TOML. An unknown fence is shown plain rather than
   guessed at. It is a lexer, not a parser: it cannot tell a type from a variable,
