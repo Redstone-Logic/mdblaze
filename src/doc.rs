@@ -52,6 +52,13 @@ impl Style {
 pub struct Span {
     pub text: String,
     pub style: Style,
+    /// The source bytes this text came from.
+    ///
+    /// What makes a click land in the right place. The rendered text is not the
+    /// source -- `**bold**` renders as `bold` -- so mapping a position on screen
+    /// back to a position in the file needs the parser's answer, not arithmetic
+    /// on the rendered characters.
+    pub source: std::ops::Range<usize>,
 }
 
 /// What kind of block this is. Decides size, weight and spacing.
@@ -140,23 +147,29 @@ pub fn parse(src: &str) -> Doc {
     // does emit, e.g. between a list marker and its paragraph) opens a paragraph
     // rather than being dropped, because dropping it loses the document.
     macro_rules! push_text {
-        ($t:expr) => {{
+        ($t:expr, $r:expr) => {{
             let t: String = $t;
+            let r: std::ops::Range<usize> = $r;
             if t.is_empty() {
             } else if let Some(b) = current.as_mut() {
-                // Merged with the previous run when the style matches, so a
-                // sentence broken by the parser into several events is measured
-                // and drawn as one.
+                // Merged with the previous run when the style matches AND the
+                // bytes follow on, so a sentence the parser split into several
+                // events is measured and drawn as one. Merging across a GAP would
+                // make the span's range cover source it does not contain, and a
+                // click inside it would land in the wrong place.
                 match b.spans.last_mut() {
-                    Some(last) if last.style == style => last.text.push_str(&t),
-                    _ => b.spans.push(Span { text: t, style }),
+                    Some(last) if last.style == style && last.source.end == r.start => {
+                        last.text.push_str(&t);
+                        last.source.end = r.end;
+                    }
+                    _ => b.spans.push(Span { text: t, style, source: r }),
                 }
             } else {
                 current = Some(Block {
                     kind: Kind::Paragraph,
-                    spans: vec![Span { text: t, style }],
+                    spans: vec![Span { text: t, style, source: r.clone() }],
                     depth,
-                    source: 0..0,
+                    source: r,
                 });
             }
         }};
@@ -283,26 +296,26 @@ pub fn parse(src: &str) -> Doc {
             Event::Start(Tag::Image { .. }) => style.italic = true,
             Event::End(TagEnd::Image) => style.italic = false,
 
-            Event::Text(t) => push_text!(t.to_string()),
+            Event::Text(t) => push_text!(t.to_string(), range.clone()),
             Event::Code(t) => {
                 let was = style.code;
                 style.code = true;
-                push_text!(t.to_string());
+                push_text!(t.to_string(), range.clone());
                 style.code = was;
             }
             // Raw HTML is TEXT, never markup. Nothing here can execute it, but
             // showing `<b>` as bold would mean this viewer disagrees with the
             // console about what the same file says.
-            Event::Html(t) | Event::InlineHtml(t) => push_text!(t.to_string()),
+            Event::Html(t) | Event::InlineHtml(t) => push_text!(t.to_string(), range.clone()),
 
-            Event::SoftBreak => push_text!(" ".to_string()),
-            Event::HardBreak => push_text!("\n".to_string()),
+            Event::SoftBreak => push_text!(" ".to_string(), range.clone()),
+            Event::HardBreak => push_text!("\n".to_string(), range.clone()),
             Event::Rule => {
                 close!();
                 doc.blocks.push(Block { kind: Kind::Rule, spans: Vec::new(), depth, source: range.clone() });
             }
             Event::TaskListMarker(done) => {
-                push_text!(if done { "[x] ".to_string() } else { "[ ] ".to_string() })
+                push_text!(if done { "[x] ".to_string() } else { "[ ] ".to_string() }, range.clone())
             }
             _ => {}
         }

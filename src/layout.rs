@@ -70,6 +70,12 @@ pub struct Run {
     pub ink: Ink,
     /// Sheared at draw time, since no oblique face is compiled in.
     pub italic: bool,
+    /// Byte offset in the source of this run's first character.
+    ///
+    /// What a click resolves through: find the run under the pointer, walk its
+    /// characters to the one clicked, and the answer is a position in the FILE
+    /// rather than on the screen.
+    pub source: usize,
 }
 
 /// A filled or stroked rectangle: a rule, a code ground, a quote bar.
@@ -275,6 +281,7 @@ pub fn lay_out(
                         px,
                         ink: Ink::Code,
                         italic: false,
+                        source: block.source.start,
                     });
                     y += lh;
                 }
@@ -303,44 +310,58 @@ pub fn lay_out(
                         px,
                         ink: Ink::Dim,
                         italic: false,
+                        source: block.source.start,
                     });
                 }
 
                 let mut cursor = text_x;
                 let mut line_start = true;
-                for Span { text: t, style } in &block.spans {
+                for span in &block.spans {
+                    let Span { text: t, style, source } = span;
                     let face = face_of(kind, style);
                     let ink = ink_of(kind, style);
+                    // How far into this span's text we have got, so each word can
+                    // be given the source byte it starts at. The span's rendered
+                    // text and its source are the same length for plain text and
+                    // differ where markers were stripped, so this is a good
+                    // approximation inside emphasis and exact outside it.
+                    let mut used = 0usize;
                     for chunk in t.split('\n') {
                         if !line_start && chunk.is_empty() {
                             y += lh;
                             cursor = text_x;
+                            used += 1;
                             continue;
                         }
                         for word in words(chunk) {
+                            let at = source.start + used;
+                            used += word.len();
                             let w = text.width(face, word, px);
                             if !line_start && cursor + w > text_x + text_avail {
                                 y += lh;
                                 cursor = text_x;
                                 line_start = true;
                             }
-                            let word = if line_start { word.trim_start() } else { word };
-                            if word.is_empty() {
+                            let trimmed = if line_start { word.trim_start() } else { word };
+                            if trimmed.is_empty() {
                                 continue;
                             }
-                            let w = text.width(face, word, px);
+                            let at = at + (word.len() - trimmed.len());
+                            let w = text.width(face, trimmed, px);
                             out.runs.push(Run {
                                 x: cursor,
                                 baseline: y + asc,
-                                text: word.to_string(),
+                                text: trimmed.to_string(),
                                 face,
                                 px,
                                 ink,
                                 italic: style.italic,
+                                source: at.min(source.end),
                             });
                             cursor += w;
                             line_start = false;
                         }
+                        used += 1; // the newline split consumed
                     }
                 }
                 y += lh;
@@ -370,6 +391,72 @@ pub fn lay_out(
 
     out.height = y + PAD;
     out
+}
+
+impl Laid {
+    /// Which source byte is under a point, in document coordinates.
+    ///
+    /// The inverse of laying out, and the reason every run records where it came
+    /// from. Without that this could only answer in screen terms, and a click
+    /// could not move a cursor that lives in the file.
+    ///
+    /// Picks the nearest LINE first and the nearest character within it second,
+    /// so clicking in the margin to the right of a line puts the caret at that
+    /// line's end -- which is what clicking past the end of a line means
+    /// everywhere else -- rather than finding nothing.
+    pub fn hit(&self, x: f32, y: f32, text: &Text) -> Option<usize> {
+        if self.runs.is_empty() {
+            return None;
+        }
+        // The closest baseline to the click. Runs on one visual line share it,
+        // so this picks a line rather than a word.
+        let mut best_line = f32::MAX;
+        let mut best_delta = f32::MAX;
+        for r in &self.runs {
+            let d = (r.baseline - y).abs();
+            if d < best_delta {
+                best_delta = d;
+                best_line = r.baseline;
+            }
+        }
+
+        let mut on_line: Vec<&Run> = self
+            .runs
+            .iter()
+            .filter(|r| (r.baseline - best_line).abs() < 0.5)
+            .collect();
+        on_line.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+
+        let first = on_line.first()?;
+        if x <= first.x {
+            return Some(first.source);
+        }
+
+        for r in &on_line {
+            let w = text.width(r.face, &r.text, r.px);
+            if x > r.x + w {
+                continue;
+            }
+            // Inside this run: walk characters until the pointer is passed, and
+            // land on whichever side of the glyph is nearer -- clicking the right
+            // half of a character puts the caret after it, as it does everywhere.
+            let mut pen = r.x;
+            let mut at = r.source;
+            for ch in r.text.chars() {
+                let adv = text.advance(r.face, ch, r.px);
+                if x < pen + adv / 2.0 {
+                    return Some(at);
+                }
+                pen += adv;
+                at += ch.len_utf8();
+            }
+            return Some(at);
+        }
+
+        // Past the end of the line: its end.
+        let last = on_line.last()?;
+        Some(last.source + last.text.len())
+    }
 }
 
 /// Lay one block out as its own markdown, and place the caret inside it.
@@ -430,6 +517,8 @@ fn lay_revealed(
                 px,
                 ink: Ink::Code,
                 italic: false,
+                // The revealed block is literal source, so this is exact.
+                source: start,
             });
             cursor_x += w;
             consumed += word.len();
@@ -670,6 +759,101 @@ mod tests {
         let all: String = l.runs.iter().map(|r| r.text.as_str()).collect();
         for word in ["One", "three", "four"] {
             assert!(all.contains(word), "{word} went missing; got {all:?}");
+        }
+    }
+
+    // ---- clicking ----------------------------------------------------------
+
+    #[test]
+    fn a_click_on_a_word_lands_on_that_word_in_the_source() {
+        let src = "# Title\n\nalpha bravo charlie\n";
+        let t = Text::new();
+        let l = lay_out(&parse(src), 800.0, 16.0, &t, None);
+        let bravo = l.runs.iter().find(|r| r.text.starts_with("bravo")).expect("run");
+        let hit = l.hit(bravo.x + 1.0, bravo.baseline, &t).expect("hit");
+        let want = src.find("bravo").expect("in source");
+        assert!(
+            hit.abs_diff(want) <= 1,
+            "clicked 'bravo' at {hit}, which is {:?} in the source, expected {want}",
+            &src[hit.min(src.len())..]
+        );
+    }
+
+    #[test]
+    fn clicking_further_right_lands_further_into_the_text() {
+        let src = "alpha bravo charlie delta\n";
+        let t = Text::new();
+        let l = lay_out(&parse(src), 800.0, 16.0, &t, None);
+        let base = l.runs[0].baseline;
+        let a = l.hit(l.runs[0].x + 2.0, base, &t).expect("a");
+        let b = l.hit(l.runs[0].x + 160.0, base, &t).expect("b");
+        assert!(b > a, "clicking right did not move further in: {a} then {b}");
+    }
+
+    #[test]
+    fn clicking_left_of_a_line_lands_at_its_start() {
+        let src = "# Title\n\nsome words here\n";
+        let t = Text::new();
+        let l = lay_out(&parse(src), 800.0, 16.0, &t, None);
+        let run = l.runs.iter().find(|r| r.text.starts_with("some")).expect("run");
+        let hit = l.hit(0.0, run.baseline, &t).expect("hit");
+        assert_eq!(hit, run.source, "clicking the margin should mean the line start");
+    }
+
+    #[test]
+    fn clicking_past_the_end_of_a_line_lands_at_its_end() {
+        // What clicking in the empty space to the right of a line means
+        // everywhere else, and the case a naive run-containment test misses.
+        let src = "short line\n";
+        let t = Text::new();
+        let l = lay_out(&parse(src), 800.0, 16.0, &t, None);
+        let base = l.runs[0].baseline;
+        let hit = l.hit(5_000.0, base, &t).expect("hit");
+        assert!(hit >= src.find("line").unwrap(), "landed at {hit}, expected the line end");
+    }
+
+    #[test]
+    fn a_click_picks_the_nearest_line_not_the_first_one() {
+        let src = "first line here\n\nsecond line here\n\nthird line here\n";
+        let t = Text::new();
+        let l = lay_out(&parse(src), 800.0, 16.0, &t, None);
+        let third = l.runs.iter().find(|r| r.text.starts_with("third")).expect("run");
+        let hit = l.hit(third.x + 1.0, third.baseline, &t).expect("hit");
+        assert!(
+            hit >= src.find("third").unwrap() - 2,
+            "clicked the third line and landed at {hit}"
+        );
+    }
+
+    #[test]
+    fn clicking_inside_a_revealed_block_is_exact() {
+        // The revealed block is literal source, so there is no approximation to
+        // make: the byte under the pointer is the byte.
+        let src = "# Heading\n";
+        let t = Text::new();
+        let l = lay_out(&parse(src), 800.0, 16.0, &t, Some(Editing { source: src, cursor: 0 }));
+        let run = l.runs.first().expect("a run");
+        let hit = l.hit(run.x + 0.5, run.baseline, &t).expect("hit");
+        assert_eq!(hit, 0, "the start of the revealed source is byte 0");
+    }
+
+    #[test]
+    fn clicking_an_empty_document_finds_nothing_rather_than_panicking() {
+        let t = Text::new();
+        let l = lay_out(&parse(""), 800.0, 16.0, &t, None);
+        assert_eq!(l.hit(10.0, 10.0, &t), None);
+    }
+
+    #[test]
+    fn every_run_can_be_clicked_back_to_a_byte_inside_the_document() {
+        // A guard against an offset that walks off the end: a click must never
+        // produce a position the buffer cannot seek to.
+        let src = "# Title\n\nsome **bold** and `code` and [a link](https://x.com)\n\n- item one\n- item two\n";
+        let t = Text::new();
+        let l = lay_out(&parse(src), 700.0, 16.0, &t, None);
+        for r in &l.runs {
+            let hit = l.hit(r.x + 1.0, r.baseline, &t).expect("hit");
+            assert!(hit <= src.len(), "run {:?} resolved to {hit}, past the end", r.text);
         }
     }
 

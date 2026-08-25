@@ -39,10 +39,10 @@ use mdedit::render::{self, Theme};
 use mdedit::text::Text;
 
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, Modifiers, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Modifiers, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, Window, WindowId};
 
 /// Pixels per wheel notch, when the platform reports notches rather than pixels.
 const LINE_SCROLL: f32 = 48.0;
@@ -62,6 +62,9 @@ struct App {
     laid_for: f32,
     scroll: f32,
     mods: Modifiers,
+    /// Where the pointer is, in window coordinates. Kept because a click event
+    /// does not carry a position -- only the move before it does.
+    pointer: (f32, f32),
     note: Option<(String, Instant)>,
     /// Set when Escape was pressed with unsaved changes. A second press closes.
     confirm_discard: bool,
@@ -149,6 +152,9 @@ impl ApplicationHandler for App {
             .with_title(self.title())
             .with_inner_size(winit::dpi::LogicalSize::new(900.0, 760.0));
         let w = Arc::new(el.create_window(attrs).expect("could not open a window"));
+        // The window is a document from edge to edge, so the pointer says so
+        // everywhere rather than changing shape over text.
+        w.set_cursor(CursorIcon::Text);
         let ctx = softbuffer::Context::new(w.clone()).expect("no drawing context");
         let surface = softbuffer::Surface::new(&ctx, w.clone()).expect("no drawing surface");
         self.window = Some(w);
@@ -259,6 +265,29 @@ impl ApplicationHandler for App {
                     self.confirm_discard = false;
                 }
                 window.request_redraw();
+            }
+
+            WindowEvent::CursorMoved { position, .. } => {
+                self.pointer = (position.x as f32, position.y as f32);
+            }
+
+            WindowEvent::MouseInput { state, button, .. }
+                if state == ElementState::Pressed && button == MouseButton::Left =>
+            {
+                let size = window.inner_size();
+                // Window coordinates to document coordinates: only the scroll
+                // separates them, because the layout is in document space.
+                let (x, y) = (self.pointer.0, self.pointer.1 + self.scroll);
+                // A click below the last line is a click at the end, which is
+                // what dragging past the bottom of a document means.
+                if let Some(byte) = self.laid.hit(x, y, &self.text) {
+                    self.buffer.set_byte_offset(byte);
+                    // The block under the caret changed, so what is revealed did
+                    // too -- the click changes the picture even though it changed
+                    // no text.
+                    self.reflow(size.width as f32);
+                    window.request_redraw();
+                }
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
@@ -432,6 +461,7 @@ fn main() {
         laid_for: 900.0,
         scroll: 0.0,
         mods: Modifiers::default(),
+        pointer: (0.0, 0.0),
         note: None,
         confirm_discard: false,
         timing,

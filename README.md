@@ -56,8 +56,9 @@ The document is always rendered. The block your caret is in shows its markdown
 so you can change it, and the moment the caret leaves, that block renders again.
 No mode to switch, no second pane: what you edit is what you are looking at.
 
-Arrow keys move the caret, the wheel and PageUp/PageDown scroll without moving
-it, Home/End go to the ends of the line. `Ctrl+S` saves, `Ctrl+Z` undoes,
+Click to put the caret where you clicked -- including in a block that is still
+rendered, which reveals it. Arrow keys move the caret, the wheel and
+PageUp/PageDown scroll without moving it, Home/End go to the ends of the line. `Ctrl+S` saves, `Ctrl+Z` undoes,
 `Ctrl+Shift+Z` or `Ctrl+Y` redoes, Escape closes -- and asks once first if there
 are unsaved changes. Tab inserts two spaces, because markdown's nesting is
 defined in spaces and a literal tab renders differently in every tool that reads
@@ -69,11 +70,17 @@ Every keystroke re-parses and re-lays out the **whole document**: about 4ms for 
 36KB file, a quarter of a frame at 60Hz. Incremental re-layout is where editors
 of this kind get complicated and subtly wrong, and at this speed it buys nothing.
 
-The map that makes it possible is that every block records the source bytes it
-came from, so a cursor -- which is a position in the source -- resolves to the
-block it is inside. Without that the two coordinate systems never meet and the
-caret can only live in a separate source pane, which is the thing live editing
-exists to avoid.
+The map that makes it possible is that every block, span and run records the
+source bytes it came from. A cursor is a position in the source and rendering
+happens in blocks, so without that map the two coordinate systems never meet:
+the caret can only live in a separate source pane, and a click can only answer
+in screen terms.
+
+Both directions are needed. Laying out turns a byte offset into a position on
+screen; clicking turns a position on screen back into a byte offset. The second
+is why runs carry provenance rather than just text -- the rendered text is not
+the source, since `**bold**` renders as `bold`, so the mapping cannot be
+arithmetic on what is displayed.
 
 Saving is a temp sibling plus a rename. `fs::write` truncates first, so a crash
 or a full disk between the truncate and the write leaves the truncated file --
@@ -89,7 +96,12 @@ at the exact moment someone asked for their work to be kept.
 - **Tables are parsed but not laid out.** They currently render as their cell
   text run together, which looks broken because it is. The next thing to fix.
 - **No selection, no clipboard, no find.** The editing is a caret, characters and
-  undo. Enough to fix a line; not yet enough to restructure a document.
+  undo, and the mouse places the caret but does not drag a selection. Enough to
+  fix a line; not yet enough to restructure a document.
+- **Clicks inside emphasis are approximate.** A span's rendered text and its
+  source are the same length for plain text and differ where markers were
+  stripped, so a click inside `**bold**` can land a character or two out. Exact
+  everywhere else, and exact in the revealed block, which is literal source.
 - **The product now renders markdown twice** -- HTML in the console, this here --
   and the two can drift. Accepted because this opens arbitrary files rather than
   organisation content, so they never render the same document.
