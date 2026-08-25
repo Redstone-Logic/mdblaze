@@ -10,6 +10,17 @@
 //! disk rather than organisation content, so the two never render the same
 //! document. If that ever stops being true, one of them has to go.
 //!
+//! # Source ranges, and why every block carries one
+//!
+//! Live editing renders the document and reveals the markdown only in the block
+//! the caret is in. That needs a map from a cursor position -- which lives in the
+//! SOURCE -- to the block it lands in, so `into_offset_iter` is used rather than
+//! the plain parser and every block records the byte range it came from.
+//!
+//! Without it the two coordinate systems never meet and the caret can only be
+//! placed in a separate source view, which is the thing live editing exists to
+//! avoid.
+//!
 //! # Why a flat list
 //!
 //! A tree would be the obvious shape and it is the wrong one. Laying out text
@@ -64,6 +75,12 @@ pub struct Block {
     pub spans: Vec<Span>,
     /// Nesting level, for indentation only.
     pub depth: u8,
+    /// The bytes of the source this block was produced from.
+    ///
+    /// What lets a cursor -- which is a position in the source -- be resolved to
+    /// the block it is inside, so that block can show its markdown while the rest
+    /// of the document stays rendered.
+    pub source: std::ops::Range<usize>,
 }
 
 /// A parsed document: blocks in order, and the links found in it.
@@ -115,6 +132,9 @@ pub fn parse(src: &str) -> Doc {
     // rather than continuing its parent's numbering.
     let mut counters: Vec<Option<u64>> = Vec::new();
     let mut current: Option<Block> = None;
+    // Extended as the block's events go by: a block's range is the span from its
+    // opening tag to its closing one, and the events between are inside it.
+    let mut span_end: usize = 0;
 
     // Push a span onto the open block. Text outside any block (which the parser
     // does emit, e.g. between a list marker and its paragraph) opens a paragraph
@@ -136,6 +156,7 @@ pub fn parse(src: &str) -> Doc {
                     kind: Kind::Paragraph,
                     spans: vec![Span { text: t, style }],
                     depth,
+                    source: 0..0,
                 });
             }
         }};
@@ -153,7 +174,17 @@ pub fn parse(src: &str) -> Doc {
         };
     }
 
-    for ev in Parser::new_ext(src, opts) {
+    for (ev, range) in Parser::new_ext(src, opts).into_offset_iter() {
+        // Every event inside a block pushes its end out, so a block that the
+        // parser reports in pieces still ends up with the range of all of them.
+        span_end = span_end.max(range.end);
+        if let Some(b) = current.as_mut() {
+            if b.source.start == 0 && b.source.end == 0 {
+                b.source = range.start..range.end;
+            } else {
+                b.source.end = b.source.end.max(range.end);
+            }
+        }
         match ev {
             Event::Start(Tag::Heading { level, .. }) => {
                 close!();
@@ -165,14 +196,14 @@ pub fn parse(src: &str) -> Doc {
                     HeadingLevel::H5 => 5,
                     HeadingLevel::H6 => 6,
                 };
-                current = Some(Block { kind: Kind::Heading(n), spans: Vec::new(), depth });
+                current = Some(Block { kind: Kind::Heading(n), spans: Vec::new(), depth, source: range.clone() });
             }
             Event::End(TagEnd::Heading(_)) => close!(),
 
             Event::Start(Tag::Paragraph) => {
                 close!();
                 let kind = if quoting > 0 { Kind::Quote } else { Kind::Paragraph };
-                current = Some(Block { kind, spans: Vec::new(), depth });
+                current = Some(Block { kind, spans: Vec::new(), depth, source: range.clone() });
             }
             Event::End(TagEnd::Paragraph) => close!(),
 
@@ -195,7 +226,7 @@ pub fn parse(src: &str) -> Doc {
                         cur
                     })
                 });
-                current = Some(Block { kind: Kind::Item { ordered: n }, spans: Vec::new(), depth });
+                current = Some(Block { kind: Kind::Item { ordered: n }, spans: Vec::new(), depth, source: range.clone() });
             }
             Event::End(TagEnd::Item) => close!(),
 
@@ -206,7 +237,7 @@ pub fn parse(src: &str) -> Doc {
                     _ => None,
                 };
                 style.code = true;
-                current = Some(Block { kind: Kind::Code { lang }, spans: Vec::new(), depth });
+                current = Some(Block { kind: Kind::Code { lang }, spans: Vec::new(), depth, source: range.clone() });
             }
             Event::End(TagEnd::CodeBlock) => {
                 style.code = false;
@@ -268,7 +299,7 @@ pub fn parse(src: &str) -> Doc {
             Event::HardBreak => push_text!("\n".to_string()),
             Event::Rule => {
                 close!();
-                doc.blocks.push(Block { kind: Kind::Rule, spans: Vec::new(), depth });
+                doc.blocks.push(Block { kind: Kind::Rule, spans: Vec::new(), depth, source: range.clone() });
             }
             Event::TaskListMarker(done) => {
                 push_text!(if done { "[x] ".to_string() } else { "[ ] ".to_string() })
@@ -277,7 +308,20 @@ pub fn parse(src: &str) -> Doc {
         }
     }
     close!();
+    let _ = span_end;
     doc
+}
+
+impl Doc {
+    /// Which block contains `byte`, if any.
+    ///
+    /// Ranges do not tile the document -- blank lines between blocks belong to
+    /// none of them -- so a cursor sitting in the gap answers `None`, and the
+    /// caller renders everything and puts the caret nowhere. That is the honest
+    /// answer: there is no block there to reveal.
+    pub fn block_at(&self, byte: usize) -> Option<usize> {
+        self.blocks.iter().position(|b| b.source.contains(&byte))
+    }
 }
 
 #[cfg(test)]
@@ -383,6 +427,52 @@ mod tests {
         let last = d.blocks.last().expect("a block");
         assert_eq!(last.kind, Kind::Paragraph);
         assert_eq!(text(last), "outside");
+    }
+
+    #[test]
+    fn a_block_knows_which_bytes_it_came_from() {
+        // The map that makes live editing possible: a cursor is a position in
+        // the source, and this is what turns it into "which block am I in".
+        let src = "# Title\n\nA paragraph.\n\n- an item\n";
+        let d = parse(src);
+        for b in &d.blocks {
+            let slice = &src[b.source.clone()];
+            assert!(!slice.trim().is_empty(), "{:?} maps to nothing", b.kind);
+        }
+        assert!(src[d.blocks[0].source.clone()].contains("Title"));
+        assert!(src[d.blocks[1].source.clone()].contains("paragraph"));
+        assert!(src[d.blocks[2].source.clone()].contains("an item"));
+    }
+
+    #[test]
+    fn a_cursor_resolves_to_the_block_it_is_inside() {
+        let src = "# Title\n\nA paragraph.\n";
+        let d = parse(src);
+        let at = |needle: &str| src.find(needle).expect("present");
+        assert_eq!(d.block_at(at("Title")), Some(0));
+        assert_eq!(d.block_at(at("paragraph")), Some(1));
+    }
+
+    #[test]
+    fn a_cursor_in_the_gap_between_blocks_belongs_to_neither() {
+        // Blank lines are not part of any block, so the honest answer is None --
+        // there is no markdown there to reveal.
+        let src = "# Title\n\n\n\nA paragraph.\n";
+        let d = parse(src);
+        let gap = src.find("\n\n\n").expect("gap") + 2;
+        assert_eq!(d.block_at(gap), None);
+    }
+
+    #[test]
+    fn ranges_are_in_document_order_and_do_not_overlap() {
+        // Overlapping ranges would make `block_at` answer whichever came first
+        // rather than the right one, and the caret would land in the wrong place.
+        let d = parse("# A\n\nb\n\n- c\n- d\n\n```\ne\n```\n");
+        let mut last = 0;
+        for b in &d.blocks {
+            assert!(b.source.start >= last, "out of order or overlapping: {:?}", b.kind);
+            last = b.source.start;
+        }
     }
 
     #[test]

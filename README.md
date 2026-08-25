@@ -52,26 +52,32 @@ mdedit --timing file.md      # and say where the time went
 mdedit --shot out.ppm f.md   # render one frame with no window at all
 ```
 
-**Reading** — arrow keys, PageUp/PageDown, Home/End and the wheel scroll. `E`
-starts editing. Escape closes.
+The document is always rendered. The block your caret is in shows its markdown
+so you can change it, and the moment the caret leaves, that block renders again.
+No mode to switch, no second pane: what you edit is what you are looking at.
 
-**Editing** — the source, in monospace, with a caret. `Ctrl+S` saves, `Ctrl+Z`
-undoes, `Ctrl+Shift+Z` or `Ctrl+Y` redoes, Escape goes back to reading and
-re-renders. Tab inserts two spaces, because markdown's nesting is defined in
-spaces and a literal tab renders differently in every tool that reads it next.
+Arrow keys move the caret, the wheel and PageUp/PageDown scroll without moving
+it, Home/End go to the ends of the line. `Ctrl+S` saves, `Ctrl+Z` undoes,
+`Ctrl+Shift+Z` or `Ctrl+Y` redoes, Escape closes -- and asks once first if there
+are unsaved changes. Tab inserts two spaces, because markdown's nesting is
+defined in spaces and a literal tab renders differently in every tool that reads
+the file next.
 
-Escape with unsaved changes asks once before discarding them.
+### Why live rendering is affordable here
 
-### Two modes, not one
+Every keystroke re-parses and re-lays out the **whole document**: about 4ms for a
+36KB file, a quarter of a frame at 60Hz. Incremental re-layout is where editors
+of this kind get complicated and subtly wrong, and at this speed it buys nothing.
 
-Editing shows the source rather than an insertion point in the rendered view.
-Mapping a cursor between rendered text and the markdown behind it is the hard
-half of a WYSIWYG editor, and getting it subtly wrong puts someone's characters
-somewhere they did not ask for. A key to switch is cheap and never lies.
+The map that makes it possible is that every block records the source bytes it
+came from, so a cursor -- which is a position in the source -- resolves to the
+block it is inside. Without that the two coordinate systems never meet and the
+caret can only live in a separate source pane, which is the thing live editing
+exists to avoid.
 
 Saving is a temp sibling plus a rename. `fs::write` truncates first, so a crash
 or a full disk between the truncate and the write leaves the truncated file --
-and it leaves it at the exact moment someone asked for their work to be kept.
+at the exact moment someone asked for their work to be kept.
 
 ## Limits, stated
 
@@ -80,7 +86,8 @@ and it leaves it at the exact moment someone asked for their work to be kept.
   fix is to embed more coverage, not to start asking the system.
 - **Synthetic italics.** Sheared from the regular face rather than a true italic,
   because `fonts-dejavu-core` ships no oblique sans.
-- **Tables are parsed but not laid out yet** -- they render as their source text.
+- **Tables are parsed but not laid out.** They currently render as their cell
+  text run together, which looks broken because it is. The next thing to fix.
 - **No selection, no clipboard, no find.** The editing is a caret, characters and
   undo. Enough to fix a line; not yet enough to restructure a document.
 - **The product now renders markdown twice** -- HTML in the console, this here --

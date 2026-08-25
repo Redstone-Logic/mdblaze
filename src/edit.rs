@@ -265,6 +265,37 @@ impl Buffer {
         self.col = goal.min(self.chars(self.line));
     }
 
+    /// The cursor as a byte offset into [`Buffer::text`].
+    ///
+    /// The bridge to the parser's world: blocks record the source bytes they came
+    /// from, so this is what turns "line 4, column 7" into "inside that heading".
+    pub fn byte_offset(&self) -> usize {
+        let mut n = 0;
+        for l in &self.lines[..self.line] {
+            n += l.len() + 1; // the newline that joins it to the next
+        }
+        n + self.byte_of(self.line, self.col)
+    }
+
+    /// Put the cursor at a byte offset, clamped into the document.
+    ///
+    /// Used after an edit re-parses: the caret must land where the text moved to,
+    /// not where it was on screen a moment ago.
+    pub fn set_byte_offset(&mut self, mut byte: usize) {
+        self.goal = None;
+        for (i, l) in self.lines.iter().enumerate() {
+            let len = l.len();
+            if byte <= len {
+                self.line = i;
+                self.col = l[..byte.min(len)].chars().count();
+                return;
+            }
+            byte -= len + 1;
+        }
+        self.line = self.lines.len() - 1;
+        self.col = self.chars(self.line);
+    }
+
     pub fn home(&mut self) {
         self.goal = None;
         self.col = 0;
@@ -466,6 +497,49 @@ mod tests {
         assert!(b.is_dirty());
         b.mark_saved();
         assert!(!b.is_dirty());
+    }
+
+    #[test]
+    fn a_byte_offset_round_trips_through_the_cursor() {
+        let mut b = buf("alpha\nbravo\ncharlie\n");
+        for (line, col) in [(0, 0), (0, 5), (1, 3), (2, 7)] {
+            b.line = line;
+            b.col = col;
+            let off = b.byte_offset();
+            b.set_byte_offset(off);
+            assert_eq!((b.line, b.col), (line, col), "offset {off} did not round trip");
+        }
+    }
+
+    #[test]
+    fn a_byte_offset_lands_correctly_in_multibyte_text() {
+        // The offset is BYTES, the column is CHARACTERS. Conflating them puts the
+        // caret several characters away from where the parser thinks it is.
+        let mut b = buf("café note\n");
+        b.line = 0;
+        b.col = 5; // after the space
+        assert_eq!(b.byte_offset(), 6, "é is two bytes");
+        b.set_byte_offset(6);
+        assert_eq!(b.col, 5);
+    }
+
+    #[test]
+    fn the_offset_agrees_with_the_text_it_indexes() {
+        let b = {
+            let mut b = buf("one\ntwo\nthree\n");
+            b.line = 2;
+            b.col = 2;
+            b
+        };
+        let t = b.text();
+        assert_eq!(&t[b.byte_offset()..b.byte_offset() + 3], "ree");
+    }
+
+    #[test]
+    fn an_offset_past_the_end_clamps_rather_than_panicking() {
+        let mut b = buf("short\n");
+        b.set_byte_offset(9_999);
+        assert_eq!((b.line, b.col), (0, 5));
     }
 
     #[test]

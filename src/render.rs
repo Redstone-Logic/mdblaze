@@ -104,6 +104,11 @@ pub fn draw(
         }
     }
 
+    // Before the text, so a caret sitting on a glyph does not cover it.
+    if let Some(c) = laid.caret {
+        fill(buf, width, height, c.x, c.top - scroll, 2.0, c.height, theme.caret);
+    }
+
     for run in &laid.runs {
         let baseline = run.baseline - scroll;
         // Skipped before a single glyph is rasterised. A generous margin either
@@ -166,7 +171,7 @@ mod tests {
 
     fn frame(src: &str, w: usize, h: usize, scroll: f32) -> Vec<u32> {
         let mut text = Text::new();
-        let laid = lay_out(&parse(src), w as f32, 16.0, &text);
+        let laid = lay_out(&parse(src), w as f32, 16.0, &text, None);
         let mut buf = vec![0u32; w * h];
         draw(&laid, &mut text, &mut buf, w, h, scroll, &Theme::DARK);
         buf
@@ -214,6 +219,34 @@ mod tests {
     }
 
     #[test]
+    fn the_caret_is_drawn_when_there_is_one() {
+        // `Laid::caret` was added and nothing painted it, so live editing had an
+        // insertion point that existed only in the layout. This is the assertion
+        // that would have caught it.
+        let src = "# Title\n\nbody\n";
+        let mut text = Text::new();
+        let (w, h) = (600usize, 400usize);
+        let d = parse(src);
+        let laid = lay_out(
+            &d, w as f32, 16.0, &text,
+            Some(crate::layout::Editing { source: src, cursor: 3 }),
+        );
+        assert!(laid.caret.is_some(), "the layout produced no caret to draw");
+        let mut buf = vec![0u32; w * h];
+        draw(&laid, &mut text, &mut buf, w, h, 0.0, &Theme::DARK);
+        assert!(
+            buf.iter().any(|p| *p == Theme::DARK.caret),
+            "the caret was never painted"
+        );
+    }
+
+    #[test]
+    fn no_caret_is_drawn_when_not_editing() {
+        let buf = frame("# Title\n\nbody\n", 600, 400, 0.0);
+        assert!(!buf.iter().any(|p| *p == Theme::DARK.caret));
+    }
+
+    #[test]
     fn a_code_block_paints_its_own_ground() {
         let buf = frame("```\ncode here\n```\n", 500, 300, 0.0);
         assert!(
@@ -223,44 +256,12 @@ mod tests {
     }
 
     #[test]
-    fn the_source_view_shows_the_source_and_a_caret() {
-        let mut text = Text::new();
-        let (w, h) = (500usize, 300usize);
-        let lines = vec!["# Heading".to_string(), "some **source**".to_string()];
-        let mut buf = vec![0u32; w * h];
-        let (top, lh) = draw_source(&lines, (1, 4), &mut text, &mut buf, w, h, 0.0, 16.0, &Theme::DARK);
-        assert!(ink_pixels(&buf, &Theme::DARK) > 200, "no source drawn");
-        assert!(buf.iter().any(|p| *p == Theme::DARK.caret), "no caret drawn");
-        assert!(top > 0.0 && lh > 0.0);
-    }
-
-    #[test]
-    fn the_caret_moves_with_the_cursor() {
-        // Otherwise it is decoration rather than a cursor, and typing appears to
-        // happen somewhere other than where it is shown.
-        let (w, h) = (500usize, 300usize);
-        let lines = vec!["aaaaaaaaaa".to_string()];
-        let caret_x = |col: usize| {
-            let mut text = Text::new();
-            let mut buf = vec![0u32; w * h];
-            draw_source(&lines, (0, col), &mut text, &mut buf, w, h, 0.0, 16.0, &Theme::DARK);
-            buf.iter()
-                .enumerate()
-                .filter(|(_, p)| **p == Theme::DARK.caret)
-                .map(|(i, _)| i % w)
-                .min()
-                .unwrap_or(0)
-        };
-        assert!(caret_x(6) > caret_x(0), "the caret did not follow the column");
-    }
-
-    #[test]
     fn the_status_line_says_when_a_file_is_modified() {
         let (w, h) = (700usize, 120usize);
         let ink = |dirty: bool| {
             let mut text = Text::new();
             let mut buf = vec![0u32; w * h];
-            draw_status(&mut text, &mut buf, w, h, 16.0, &Theme::DARK, "notes.md", dirty, true, None);
+            draw_status(&mut text, &mut buf, w, h, 16.0, &Theme::DARK, "notes.md", dirty, None);
             buf.iter().filter(|p| **p == Theme::DARK.caret).count()
         };
         assert_eq!(ink(false), 0, "an unmodified file claimed to be modified");
@@ -273,7 +274,7 @@ mod tests {
         let render = |note: Option<&str>| {
             let mut text = Text::new();
             let mut buf = vec![0u32; w * h];
-            draw_status(&mut text, &mut buf, w, h, 16.0, &Theme::DARK, "n.md", false, true, note);
+            draw_status(&mut text, &mut buf, w, h, 16.0, &Theme::DARK, "n.md", false, note);
             buf
         };
         assert_ne!(render(None), render(Some("saved")), "the note changed nothing");
@@ -294,7 +295,7 @@ mod tests {
         let w = 400usize;
         let rightmost = |italic: bool| {
             let mut text = Text::new();
-            let mut laid = lay_out(&parse("MMMM"), w as f32, 40.0, &text);
+            let mut laid = lay_out(&parse("MMMM"), w as f32, 40.0, &text, None);
             for r in laid.runs.iter_mut() {
                 r.italic = italic;
             }
@@ -375,55 +376,6 @@ pub fn status_height(base: f32) -> f32 {
     base * 1.9
 }
 
-/// The source, as source: monospace lines with a caret.
-///
-/// Deliberately NOT the rendered view with an insertion point in it. Mapping a
-/// cursor between rendered text and the markdown that produced it is the hard
-/// part of a WYSIWYG editor, and getting it subtly wrong moves someone's
-/// characters somewhere they did not ask for. Showing the source while editing
-/// is honest about what is being changed, and switching back is one key.
-///
-/// Returns the caret's top and the line height, so the caller can keep it in view.
-#[allow(clippy::too_many_arguments)]
-pub fn draw_source(
-    lines: &[String],
-    cursor: (usize, usize),
-    text: &mut Text,
-    buf: &mut [u32],
-    width: usize,
-    height: usize,
-    scroll: f32,
-    base: f32,
-    theme: &Theme,
-) -> (f32, f32) {
-    buf.fill(theme.bg);
-    let px = base * 0.95;
-    let lh = text.line_height_with(Face::Mono, px, CODE_LEADING);
-    let asc = text.ascent(Face::Mono, px);
-    let left = PAD;
-    let (cur_line, cur_col) = cursor;
-
-    for (i, line) in lines.iter().enumerate() {
-        let top = PAD + i as f32 * lh - scroll;
-        // Culled before any glyph is touched, so a long file costs what is on
-        // screen rather than what it contains.
-        if top + lh < 0.0 || top > height as f32 {
-            continue;
-        }
-        draw_text(text, buf, width, height, left, top + asc, line, Face::Mono, px, theme.code);
-    }
-
-    // The caret last, so it is never painted over by the line it sits in.
-    let caret_top = PAD + cur_line as f32 * lh;
-    let prefix: String = lines
-        .get(cur_line)
-        .map(|l| l.chars().take(cur_col).collect())
-        .unwrap_or_default();
-    let caret_x = left + text.width(Face::Mono, &prefix, px);
-    fill(buf, width, height, caret_x, caret_top - scroll, 2.0, lh, theme.caret);
-    (caret_top, lh)
-}
-
 /// One line at the bottom: what file, whether it is modified, and what to press.
 pub fn draw_status(
     text: &mut Text,
@@ -434,7 +386,6 @@ pub fn draw_status(
     theme: &Theme,
     name: &str,
     dirty: bool,
-    editing: bool,
     note: Option<&str>,
 ) {
     let bh = status_height(base);
@@ -451,11 +402,7 @@ pub fn draw_status(
         // for decoration the way a lone dot can.
         x = draw_text(text, buf, width, height, x + base * 0.5, baseline, "modified", Face::Sans, px, theme.caret);
     }
-    let hint = note.unwrap_or(if editing {
-        "editing  ·  Ctrl+S save  ·  Ctrl+Z undo  ·  Esc read"
-    } else {
-        "reading  ·  E edit  ·  Esc close"
-    });
+    let hint = note.unwrap_or("Ctrl+S save  ·  Ctrl+Z undo  ·  Esc close");
     let hw = text.width(Face::Sans, hint, px);
     let hx = (width as f32 - PAD - hw).max(x + base);
     draw_text(text, buf, width, height, hx, baseline, hint, Face::Sans, px, theme.dim);

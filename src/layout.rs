@@ -17,6 +17,22 @@
 //! This is the same rule the console applies at `46rem`; it is repeated here
 //! rather than shared because the two have no code in common, and a constant is
 //! a cheaper thing to keep in step than a dependency.
+//!
+//! # Live editing
+//!
+//! When [`Editing`] is supplied, the block the cursor is inside is laid out as
+//! its own MARKDOWN and every other block stays rendered. So a heading looks like
+//! a heading until the caret enters it, at which point the `##` appears and can
+//! be edited, and leaving it puts the heading back.
+//!
+//! That is the whole trick, and it is only affordable because parsing and laying
+//! out this document takes about four milliseconds: the entire thing is redone on
+//! every keystroke rather than patched incrementally. Incremental re-layout is
+//! where editors of this kind become complicated and wrong, and it buys nothing
+//! at this speed.
+//!
+//! The caret comes back in [`Laid::caret`] because only the layout knows where a
+//! byte offset ended up on screen -- it is the thing that put it there.
 
 use crate::doc::{Doc, Kind, Span, Style};
 use crate::text::{Face, Text, CODE_LEADING};
@@ -66,6 +82,14 @@ pub struct Shape {
     pub ink: Ink,
 }
 
+/// What the caller needs to know to draw a caret: where, and how tall.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Caret {
+    pub x: f32,
+    pub top: f32,
+    pub height: f32,
+}
+
 /// A laid-out document.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Laid {
@@ -73,6 +97,17 @@ pub struct Laid {
     pub shapes: Vec<Shape>,
     /// Total height, so the caller knows how far it can scroll.
     pub height: f32,
+    /// Where the insertion point landed, when editing.
+    pub caret: Option<Caret>,
+}
+
+/// The state of an edit in progress.
+#[derive(Debug, Clone, Copy)]
+pub struct Editing<'a> {
+    /// The document's source, which the revealed block is sliced out of.
+    pub source: &'a str,
+    /// The cursor, as a byte offset into `source`.
+    pub cursor: usize,
 }
 
 /// Point size for each block kind at a base size.
@@ -156,7 +191,16 @@ fn words(s: &str) -> Vec<&str> {
 }
 
 /// Lay `doc` out for a window `width` pixels across.
-pub fn lay_out(doc: &Doc, width: f32, base: f32, text: &Text) -> Laid {
+///
+/// Pass `editing` to reveal the markdown of the block the cursor is in and get
+/// the caret's position back.
+pub fn lay_out(
+    doc: &Doc,
+    width: f32,
+    base: f32,
+    text: &Text,
+    editing: Option<Editing>,
+) -> Laid {
     let mut out = Laid::default();
     // Centred when the window is wider than the measure, so growing the window
     // gives margins rather than longer lines.
@@ -165,12 +209,40 @@ pub fn lay_out(doc: &Doc, width: f32, base: f32, text: &Text) -> Laid {
     let mut y = PAD;
     let mut prev: Option<Kind> = None;
 
-    for block in &doc.blocks {
+    // Which block, if any, shows its source instead of its rendering.
+    let reveal = editing.and_then(|e| doc.block_at(e.cursor));
+    // The end of the last block passed, so a cursor sitting in the blank line
+    // between two blocks can still be given somewhere to be.
+    let mut prev_source_end = 0usize;
+
+    for (i, block) in doc.blocks.iter().enumerate() {
         y += gap_before(&block.kind, prev.as_ref(), base);
+
+        // A cursor in the gap before this block: no markdown to reveal, but it
+        // still needs a caret, or typing into a blank line looks like nothing is
+        // happening.
+        if let Some(e) = editing {
+            if out.caret.is_none()
+                && reveal.is_none()
+                && e.cursor >= prev_source_end
+                && e.cursor < block.source.start
+            {
+                out.caret = Some(Caret { x: left, top: y, height: base * 1.3 });
+            }
+        }
+
         let px = size_of(&block.kind, base);
         let indent = INDENT * f32::from(block.depth);
         let x0 = left + indent;
         let avail = (column - indent).max(80.0);
+
+        if Some(i) == reveal {
+            let e = editing.expect("reveal implies editing");
+            y = lay_revealed(&mut out, text, e, block, x0, y, avail, base);
+            prev = Some(block.kind.clone());
+            prev_source_end = block.source.end;
+            continue;
+        }
 
         match &block.kind {
             Kind::Rule => {
@@ -209,20 +281,16 @@ pub fn lay_out(doc: &Doc, width: f32, base: f32, text: &Text) -> Laid {
                 y += pad;
             }
             kind => {
-                // A bar down the side of a quote, drawn once the height is known,
-                // so its position is remembered and its size filled in after.
                 let quote_at = matches!(kind, Kind::Quote).then_some(y);
 
                 let marker = match kind {
                     Kind::Item { ordered: Some(n) } => Some(format!("{n}.")),
-                    Kind::Item { ordered: None } => Some("•".to_string()),
+                    Kind::Item { ordered: None } => Some("\u{2022}".to_string()),
                     _ => None,
                 };
 
                 let lh = text.line_height(Face::Sans, px);
                 let asc = text.ascent(Face::Sans, px);
-                // The marker hangs in the margin so the text edges line up down
-                // the list rather than stepping in and out with the number.
                 let text_x = if marker.is_some() { x0 + INDENT } else { x0 };
                 let text_avail = (avail - (text_x - x0)).max(60.0);
 
@@ -244,7 +312,6 @@ pub fn lay_out(doc: &Doc, width: f32, base: f32, text: &Text) -> Laid {
                     let face = face_of(kind, style);
                     let ink = ink_of(kind, style);
                     for chunk in t.split('\n') {
-                        // A hard break inside a paragraph starts a new line.
                         if !line_start && chunk.is_empty() {
                             y += lh;
                             cursor = text_x;
@@ -257,8 +324,6 @@ pub fn lay_out(doc: &Doc, width: f32, base: f32, text: &Text) -> Laid {
                                 cursor = text_x;
                                 line_start = true;
                             }
-                            // A leading space at the start of a line is the
-                            // remains of the break and should not indent it.
                             let word = if line_start { word.trim_start() } else { word };
                             if word.is_empty() {
                                 continue;
@@ -292,10 +357,98 @@ pub fn lay_out(doc: &Doc, width: f32, base: f32, text: &Text) -> Laid {
             }
         }
         prev = Some(block.kind.clone());
+        prev_source_end = block.source.end;
+    }
+
+    // A cursor past the last block -- at the end of the document, or in trailing
+    // blank lines -- still needs somewhere to be.
+    if let Some(e) = editing {
+        if out.caret.is_none() && e.cursor >= prev_source_end {
+            out.caret = Some(Caret { x: left, top: y + base * 0.4, height: base * 1.3 });
+        }
     }
 
     out.height = y + PAD;
     out
+}
+
+/// Lay one block out as its own markdown, and place the caret inside it.
+///
+/// The revealed block is drawn in mono on a tinted ground: it is source, and
+/// making it look like source is the point -- the reader can see exactly which
+/// characters they are changing, which is what a rendered-only editor cannot say.
+fn lay_revealed(
+    out: &mut Laid,
+    text: &Text,
+    e: Editing,
+    block: &crate::doc::Block,
+    x0: f32,
+    mut y: f32,
+    avail: f32,
+    base: f32,
+) -> f32 {
+    let face = Face::Mono;
+    let px = base * 0.95;
+    let lh = text.line_height_with(face, px, CODE_LEADING);
+    let asc = text.ascent(face, px);
+    let pad = base * 0.4;
+    let src = &e.source[block.source.clone()];
+
+    let ground_top = y;
+    y += pad;
+
+    // Byte offset of the start of the current source line, so the caret can be
+    // matched against the cursor's absolute offset in the document.
+    let mut at = block.source.start;
+    for line in src.split('\n') {
+        let mut cursor_x = x0 + pad;
+        let mut consumed = 0usize; // bytes of this line already placed
+
+        // Wrapped by words like prose, because a long paragraph's source is one
+        // very long line and clipping it would hide what is being edited.
+        for word in words(line) {
+            let w = text.width(face, word, px);
+            if consumed > 0 && cursor_x + w > x0 + avail - pad {
+                y += lh;
+                cursor_x = x0 + pad;
+            }
+            // The caret, if it falls inside this word.
+            let start = at + consumed;
+            if e.cursor >= start && e.cursor <= start + word.len() && out.caret.is_none() {
+                let upto = &word[..(e.cursor - start).min(word.len())];
+                out.caret = Some(Caret {
+                    x: cursor_x + text.width(face, upto, px),
+                    top: y,
+                    height: lh,
+                });
+            }
+            out.runs.push(Run {
+                x: cursor_x,
+                baseline: y + asc,
+                text: word.to_string(),
+                face,
+                px,
+                ink: Ink::Code,
+                italic: false,
+            });
+            cursor_x += w;
+            consumed += word.len();
+        }
+        // An empty source line still occupies one, and the caret can sit on it.
+        if line.is_empty() && e.cursor == at && out.caret.is_none() {
+            out.caret = Some(Caret { x: x0 + pad, top: y, height: lh });
+        }
+        at += line.len() + 1; // the newline
+        y += lh;
+    }
+
+    y += pad;
+    // Behind the text, so it is inserted before the runs just pushed.
+    out.shapes.insert(
+        0,
+        Shape { x: x0, y: ground_top, w: avail, h: y - ground_top, ink: Ink::Code },
+    );
+    y
 }
 
 #[cfg(test)]
@@ -304,7 +457,7 @@ mod tests {
     use crate::doc::parse;
 
     fn lay(src: &str, width: f32) -> Laid {
-        lay_out(&parse(src), width, 16.0, &Text::new())
+        lay_out(&parse(src), width, 16.0, &Text::new(), None)
     }
 
     #[test]
@@ -408,6 +561,116 @@ mod tests {
     fn an_empty_document_lays_out_to_nothing() {
         let l = lay("", 800.0);
         assert!(l.runs.is_empty() && l.shapes.is_empty());
+    }
+
+    // ---- live editing ----------------------------------------------------
+
+    fn editing(src: &str, cursor: usize, width: f32) -> Laid {
+        let d = parse(src);
+        lay_out(&d, width, 16.0, &Text::new(), Some(Editing { source: src, cursor }))
+    }
+
+    #[test]
+    fn the_block_under_the_caret_shows_its_markdown() {
+        // The whole feature: a heading looks like a heading until the caret is
+        // in it, and then the hashes appear so they can be edited.
+        let src = "# Title\n\nA paragraph.\n";
+        let inside = editing(src, src.find("Title").unwrap(), 800.0);
+        assert!(
+            inside.runs.iter().any(|r| r.text.contains('#')),
+            "the markdown was not revealed: {:?}",
+            inside.runs.iter().map(|r| &r.text).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn every_other_block_stays_rendered() {
+        // If revealing one block revealed them all this would just be a source
+        // view with extra steps.
+        let src = "# Title\n\nA paragraph.\n";
+        let l = editing(src, src.find("Title").unwrap(), 800.0);
+        assert!(
+            l.runs.iter().any(|r| r.text.starts_with("paragraph") || r.text.starts_with("A")),
+            "the other block lost its rendering"
+        );
+        let hashes = l.runs.iter().filter(|r| r.text.contains('#')).count();
+        assert_eq!(hashes, 1, "more than one block revealed its source");
+    }
+
+    #[test]
+    fn moving_the_caret_moves_which_block_is_revealed() {
+        let src = "# Title\n\nA paragraph.\n";
+        let in_heading = editing(src, src.find("Title").unwrap(), 800.0);
+        let in_para = editing(src, src.find("paragraph").unwrap(), 800.0);
+        assert!(in_heading.runs.iter().any(|r| r.text.contains('#')));
+        assert!(
+            !in_para.runs.iter().any(|r| r.text.contains('#')),
+            "the heading stayed revealed after the caret left it"
+        );
+    }
+
+    #[test]
+    fn a_caret_is_produced_and_sits_inside_the_revealed_block() {
+        let src = "# Title\n\nbody\n";
+        let l = editing(src, src.find("itle").unwrap(), 800.0);
+        let c = l.caret.expect("no caret");
+        assert!(c.height > 0.0);
+        // Inside the ground drawn for the revealed block.
+        let ground = l.shapes.iter().find(|s| s.ink == Ink::Code).expect("no ground");
+        assert!(
+            c.top >= ground.y - 1.0 && c.top <= ground.y + ground.h,
+            "caret at {} is outside the revealed block {}..{}",
+            c.top,
+            ground.y,
+            ground.y + ground.h
+        );
+    }
+
+    #[test]
+    fn the_caret_advances_along_the_line_as_the_cursor_does() {
+        let src = "# Heading here\n";
+        let a = editing(src, 2, 800.0).caret.expect("caret");
+        let b = editing(src, 9, 800.0).caret.expect("caret");
+        assert!(b.x > a.x, "caret did not move: {} then {}", a.x, b.x);
+    }
+
+    #[test]
+    fn a_caret_in_the_gap_between_blocks_still_gets_a_position() {
+        // Typing into a blank line must not look like nothing is happening.
+        let src = "# Title\n\n\n\nbody\n";
+        let gap = src.find("\n\n\n").expect("gap") + 2;
+        let l = editing(src, gap, 800.0);
+        assert!(l.caret.is_some(), "no caret in the gap");
+        assert!(
+            !l.runs.iter().any(|r| r.text.contains('#')),
+            "a gap revealed a block it is not inside"
+        );
+    }
+
+    #[test]
+    fn a_caret_at_the_very_end_of_the_document_gets_a_position() {
+        let src = "# Title\n\nbody\n";
+        let l = editing(src, src.len(), 800.0);
+        let c = l.caret.expect("no caret at end of document");
+        assert!(c.top > 0.0);
+    }
+
+    #[test]
+    fn laying_out_without_editing_produces_no_caret() {
+        let l = lay("# Title\n\nbody\n", 800.0);
+        assert!(l.caret.is_none());
+    }
+
+    #[test]
+    fn revealing_a_block_does_not_lose_the_rest_of_the_document() {
+        // A regression guard: an early version returned after the revealed block
+        // and silently truncated everything below it.
+        let src = "# One\n\ntwo\n\nthree\n\nfour\n";
+        let l = editing(src, src.find("two").unwrap(), 800.0);
+        let all: String = l.runs.iter().map(|r| r.text.as_str()).collect();
+        for word in ["One", "three", "four"] {
+            assert!(all.contains(word), "{word} went missing; got {all:?}");
+        }
     }
 
     #[test]
