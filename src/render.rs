@@ -10,7 +10,7 @@
 //! scrolling a short one.
 
 use crate::layout::{Ink, Laid, PAD};
-use crate::text::{Face, Text, CODE_LEADING, SHEAR};
+use crate::text::{Face, Text, SHEAR};
 
 /// Colours, as `0x00RRGGBB` to match softbuffer's format.
 #[derive(Debug, Clone, Copy)]

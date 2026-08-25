@@ -93,8 +93,10 @@ at the exact moment someone asked for their work to be kept.
   fix is to embed more coverage, not to start asking the system.
 - **Synthetic italics.** Sheared from the regular face rather than a true italic,
   because `fonts-dejavu-core` ships no oblique sans.
-- **Tables are parsed but not laid out.** They currently render as their cell
-  text run together, which looks broken because it is. The next thing to fix.
+- **Tables do not scroll sideways.** A table with many columns is scaled down
+  until a minimum width, then overflows the measure rather than shrinking a
+  column to nothing -- a column of no width shows nothing, which is worse than
+  crowding.
 - **No selection, no clipboard, no find.** The editing is a caret, characters and
   undo, and the mouse places the caret but does not drag a selection. Enough to
   fix a line; not yet enough to restructure a document.

@@ -73,6 +73,18 @@ pub enum Kind {
     Code { lang: Option<String> },
     Quote,
     Rule,
+    /// One row of a table.
+    ///
+    /// Rows are separate blocks rather than a table being one block with a
+    /// nested shape, because everything else here is a flat list walked in
+    /// order and a table is the only thing that would have needed a tree. The
+    /// layout gathers consecutive rows back together to measure the columns,
+    /// which it has to do anyway -- column widths are a property of the whole
+    /// table, not of any one row.
+    ///
+    /// `cells` holds the index into `spans` where each cell starts, so the flat
+    /// span list keeps working and no cell text is copied.
+    TableRow { header: bool, cells: Vec<usize> },
 }
 
 /// One block, in document order.
@@ -172,6 +184,13 @@ pub fn parse(src: &str) -> Doc {
                     source: r,
                 });
             }
+            // Grow the block to cover what was just put in it. Only text does
+            // this, so a block can never reach past its own content.
+            if let Some(b) = current.as_mut() {
+                if let Some(last) = b.spans.last() {
+                    b.source.end = b.source.end.max(last.source.end);
+                }
+            }
         }};
     }
 
@@ -180,24 +199,24 @@ pub fn parse(src: &str) -> Doc {
             if let Some(b) = current.take() {
                 // A block with no text is not a blank line, it is nothing --
                 // except a rule, which is all shape and no text.
-                if b.kind == Kind::Rule || b.spans.iter().any(|s| !s.text.trim().is_empty()) {
+                let keeps = b.kind == Kind::Rule
+                    || matches!(b.kind, Kind::TableRow { .. })
+                    || b.spans.iter().any(|s| !s.text.trim().is_empty());
+                if keeps {
                     doc.blocks.push(b);
                 }
             }
         };
     }
 
+    // A block's range is NOT extended by every event that passes while it is open.
+    // A `Start` tag carries the range of its whole element, so extending on one
+    // made the open block swallow the entire next paragraph before it closed --
+    // and the paragraph then got no block of its own. Block-level starts set the
+    // range exactly; only blocks opened implicitly by text (a table cell, say)
+    // grow, and only by the text pushed into them.
     for (ev, range) in Parser::new_ext(src, opts).into_offset_iter() {
-        // Every event inside a block pushes its end out, so a block that the
-        // parser reports in pieces still ends up with the range of all of them.
         span_end = span_end.max(range.end);
-        if let Some(b) = current.as_mut() {
-            if b.source.start == 0 && b.source.end == 0 {
-                b.source = range.start..range.end;
-            } else {
-                b.source.end = b.source.end.max(range.end);
-            }
-        }
         match ev {
             Event::Start(Tag::Heading { level, .. }) => {
                 close!();
@@ -263,6 +282,39 @@ pub fn parse(src: &str) -> Doc {
                     }
                 }
                 close!();
+            }
+
+            // ---- tables ----------------------------------------------------
+            Event::Start(Tag::Table(_)) => close!(),
+            Event::End(TagEnd::Table) => close!(),
+            Event::Start(Tag::TableHead) => {
+                close!();
+                current = Some(Block {
+                    kind: Kind::TableRow { header: true, cells: Vec::new() },
+                    spans: Vec::new(),
+                    depth,
+                    source: range.clone(),
+                });
+            }
+            Event::Start(Tag::TableRow) => {
+                close!();
+                current = Some(Block {
+                    kind: Kind::TableRow { header: false, cells: Vec::new() },
+                    spans: Vec::new(),
+                    depth,
+                    source: range.clone(),
+                });
+            }
+            Event::End(TagEnd::TableHead) | Event::End(TagEnd::TableRow) => close!(),
+            Event::Start(Tag::TableCell) => {
+                // Where this cell's spans begin. Recorded even for an empty cell,
+                // so a blank column still occupies its place in the row.
+                if let Some(b) = current.as_mut() {
+                    let at = b.spans.len();
+                    if let Kind::TableRow { cells, .. } = &mut b.kind {
+                        cells.push(at);
+                    }
+                }
             }
 
             Event::Start(Tag::BlockQuote(_)) => {

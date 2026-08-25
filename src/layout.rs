@@ -132,7 +132,10 @@ fn size_of(kind: &Kind, base: f32) -> f32 {
 fn face_of(kind: &Kind, style: &Style) -> Face {
     if style.code || matches!(kind, Kind::Code { .. }) {
         Face::Mono
-    } else if style.bold || matches!(kind, Kind::Heading(_)) {
+    } else if style.bold
+        || matches!(kind, Kind::Heading(_))
+        || matches!(kind, Kind::TableRow { header: true, .. })
+    {
         Face::SansBold
     } else {
         Face::Sans
@@ -164,6 +167,8 @@ fn gap_before(kind: &Kind, prev: Option<&Kind>, base: f32) -> f32 {
         // Consecutive list items are one list, not several: a paragraph gap
         // between them makes a tight list look like a loose one.
         Kind::Item { .. } if matches!(prev, Some(Kind::Item { .. })) => base * 0.28,
+        // Rows of one table are not separate paragraphs.
+        Kind::TableRow { .. } if matches!(prev, Some(Kind::TableRow { .. })) => 0.0,
         Kind::Rule => base * 1.2,
         _ => base * 0.85,
     }
@@ -221,7 +226,14 @@ pub fn lay_out(
     // between two blocks can still be given somewhere to be.
     let mut prev_source_end = 0usize;
 
+    // Rows already laid out as part of a table, so the loop does not draw them
+    // again one at a time.
+    let mut done_to = 0usize;
+
     for (i, block) in doc.blocks.iter().enumerate() {
+        if i < done_to {
+            continue;
+        }
         y += gap_before(&block.kind, prev.as_ref(), base);
 
         // A cursor in the gap before this block: no markdown to reveal, but it
@@ -241,6 +253,23 @@ pub fn lay_out(
         let indent = INDENT * f32::from(block.depth);
         let x0 = left + indent;
         let avail = (column - indent).max(80.0);
+
+        // A table is measured whole: a column is as wide as its widest cell in
+        // ANY row, so the rows cannot be laid out one at a time as the flat list
+        // would otherwise have them.
+        if matches!(block.kind, Kind::TableRow { .. }) {
+            let mut j = i;
+            while j < doc.blocks.len() && matches!(doc.blocks[j].kind, Kind::TableRow { .. }) {
+                j += 1;
+            }
+            let rows = &doc.blocks[i..j];
+            let reveal_rel = reveal.and_then(|r| (r >= i && r < j).then_some(r - i));
+            y = lay_table(&mut out, text, editing, rows, reveal_rel, x0, y, avail, base);
+            done_to = j;
+            prev = Some(block.kind.clone());
+            prev_source_end = doc.blocks[j - 1].source.end;
+            continue;
+        }
 
         if Some(i) == reveal {
             let e = editing.expect("reveal implies editing");
@@ -457,6 +486,144 @@ impl Laid {
         let last = on_line.last()?;
         Some(last.source + last.text.len())
     }
+}
+
+/// Lay a run of table rows out as a table.
+///
+/// Column widths come from the widest cell in any row, then are scaled down
+/// together if the table is wider than the space -- so the columns stay in
+/// proportion rather than the last one being squeezed to nothing.
+#[allow(clippy::too_many_arguments)]
+fn lay_table(
+    out: &mut Laid,
+    text: &Text,
+    editing: Option<Editing>,
+    rows: &[crate::doc::Block],
+    reveal_rel: Option<usize>,
+    x0: f32,
+    mut y: f32,
+    avail: f32,
+    base: f32,
+) -> f32 {
+    let px = base * 0.94;
+    let lh = text.line_height(Face::Sans, px);
+    let asc = text.ascent(Face::Sans, px);
+    let cell_pad = base * 0.55;
+
+    // Cells, as slices into each row's flat span list.
+    let cells_of = |b: &crate::doc::Block| -> Vec<(usize, usize)> {
+        let Kind::TableRow { cells, .. } = &b.kind else { return Vec::new() };
+        let mut out = Vec::new();
+        for (n, start) in cells.iter().enumerate() {
+            let end = cells.get(n + 1).copied().unwrap_or(b.spans.len());
+            out.push((*start, end));
+        }
+        out
+    };
+
+    let columns = rows.iter().map(|r| cells_of(r).len()).max().unwrap_or(0);
+    if columns == 0 {
+        return y;
+    }
+
+    // Natural width of every column: the widest cell in it, plus padding.
+    let mut widths = vec![0.0f32; columns];
+    for row in rows {
+        let header = matches!(row.kind, Kind::TableRow { header: true, .. });
+        let face = if header { Face::SansBold } else { Face::Sans };
+        for (n, (a, b)) in cells_of(row).into_iter().enumerate() {
+            let w: f32 = row.spans[a..b]
+                .iter()
+                .map(|s| text.width(if s.style.code { Face::Mono } else { face }, &s.text, px))
+                .sum();
+            widths[n] = widths[n].max(w + cell_pad * 2.0);
+        }
+    }
+
+    // Scaled together if too wide. A minimum stops a column vanishing entirely,
+    // at the cost of the table overflowing when there are very many columns --
+    // which is the honest failure, since a column of no width shows nothing.
+    let total: f32 = widths.iter().sum();
+    if total > avail {
+        let min = base * 3.0;
+        let scale = avail / total;
+        for w in widths.iter_mut() {
+            *w = (*w * scale).max(min);
+        }
+    }
+
+    for (n, row) in rows.iter().enumerate() {
+        if Some(n) == reveal_rel {
+            let e = editing.expect("reveal implies editing");
+            y = lay_revealed(out, text, e, row, x0, y, avail, base);
+            continue;
+        }
+        let header = matches!(row.kind, Kind::TableRow { header: true, .. });
+        let face = if header { Face::SansBold } else { Face::Sans };
+        let ink = if header { Ink::Strong } else { Ink::Body };
+
+        let mut x = x0;
+        let mut tallest = lh;
+        for (n_cell, (a, b)) in cells_of(row).into_iter().enumerate() {
+            let w = widths.get(n_cell).copied().unwrap_or(base * 4.0);
+            let mut pen = x + cell_pad;
+            let mut line = 0.0f32;
+            for span in &row.spans[a..b] {
+                // The span's own emphasis still counts inside a cell: a bold word
+                // in a body row was coming out plain because the face was chosen
+                // from the header flag alone.
+                let f = if span.style.code {
+                    Face::Mono
+                } else if span.style.bold {
+                    Face::SansBold
+                } else {
+                    face
+                };
+                // Wrapped inside the column rather than spilling into the next
+                // one, which is what makes a table read as a grid at all.
+                for word in words(&span.text) {
+                    let ww = text.width(f, word, px);
+                    if pen > x + cell_pad && pen + ww > x + w - cell_pad {
+                        line += lh;
+                        pen = x + cell_pad;
+                    }
+                    let trimmed = if pen == x + cell_pad { word.trim_start() } else { word };
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    out.runs.push(Run {
+                        x: pen,
+                        baseline: y + line + asc,
+                        text: trimmed.to_string(),
+                        face: f,
+                        px,
+                        ink: if span.style.code { Ink::Code } else { ink },
+                        italic: span.style.italic,
+                        source: span.source.start,
+                    });
+                    pen += text.width(f, trimmed, px);
+                }
+            }
+            tallest = tallest.max(line + lh);
+            x += w;
+        }
+
+        y += tallest;
+        // A rule under the header, and nothing between body rows: the alignment
+        // of the columns is what separates them, and a line per row turns a small
+        // table into a cage.
+        if header {
+            out.shapes.push(Shape {
+                x: x0,
+                y,
+                w: (x - x0).min(avail),
+                h: 1.0,
+                ink: Ink::Dim,
+            });
+            y += base * 0.25;
+        }
+    }
+    y
 }
 
 /// Lay one block out as its own markdown, and place the caret inside it.
@@ -760,6 +927,103 @@ mod tests {
         for word in ["One", "three", "four"] {
             assert!(all.contains(word), "{word} went missing; got {all:?}");
         }
+    }
+
+    // ---- tables --------------------------------------------------------------
+
+    // Deliberately distinct first words per cell: searching runs by text prefix
+    // is how these tests find a cell, and "head one"/"head two" both start with
+    // "head", which finds the wrong run and fails for the wrong reason.
+    const TABLE: &str = "| alpha | bravo |\n|---|---|\n| a | b |\n| ccc | ddd |\n";
+
+    /// Find a run by its EXACT text. Prefix matching finds "alpha" when asked
+    /// for "a", which fails these tests for a reason that has nothing to do with
+    /// tables.
+    fn run_of<'a>(l: &'a Laid, want: &str) -> Option<&'a Run> {
+        l.runs.iter().find(|r| r.text.trim() == want)
+    }
+
+    #[test]
+    fn a_table_puts_its_columns_in_columns() {
+        // The bug this fixes: every cell became one run of prose, so a table read
+        // as "head onehead twoab" -- present, and unreadable.
+        let l = lay(TABLE, 800.0);
+        let c1 = run_of(&l, "alpha").expect("col 1").x;
+        let c2 = run_of(&l, "bravo").expect("col 2 missing").x;
+        assert!(c2 > c1, "the second column is not right of the first");
+    }
+
+    #[test]
+    fn a_column_lines_up_down_the_table() {
+        // What makes it a table rather than rows of text: the same column starts
+        // at the same x in every row.
+        let l = lay(TABLE, 800.0);
+        let second_col_x: Vec<f32> =
+            ["bravo", "b", "ddd"].iter().filter_map(|t| run_of(&l, t).map(|r| r.x)).collect();
+        assert_eq!(second_col_x.len(), 3, "not all rows found");
+        for w in second_col_x.windows(2) {
+            assert!((w[0] - w[1]).abs() < 0.5, "column drifted: {second_col_x:?}");
+        }
+    }
+
+    #[test]
+    fn rows_go_down_the_page_in_order() {
+        let l = lay(TABLE, 800.0);
+        let y_of = |t: &str| run_of(&l, t).map(|r| r.baseline).expect(t);
+        assert!(y_of("a") > y_of("alpha"), "body above header");
+        assert!(y_of("ccc") > y_of("a"), "rows out of order");
+    }
+
+    #[test]
+    fn the_header_is_ruled_off_and_the_body_is_not() {
+        // One line under the header; a line per row turns a small table into a
+        // cage, and the column alignment already separates them.
+        let l = lay(TABLE, 800.0);
+        let rules = l.shapes.iter().filter(|s| s.h <= 2.0 && s.ink == Ink::Dim).count();
+        assert_eq!(rules, 1, "expected exactly one rule, got {rules}");
+    }
+
+    #[test]
+    fn a_narrow_window_keeps_every_column_visible() {
+        // Scaled together rather than squeezing the last column to nothing: a
+        // column of no width shows nothing at all, which is worse than crowding.
+        let l = lay(TABLE, 260.0);
+        for t in ["alpha", "bravo", "ccc", "ddd"] {
+            assert!(run_of(&l, t).is_some(), "{t:?} vanished at a narrow width");
+        }
+    }
+
+    #[test]
+    fn emphasis_inside_a_cell_survives() {
+        // The face was chosen from the header flag alone, so a bold word in a
+        // body row came out plain -- markup silently dropped rather than shown.
+        let l = lay("| a | b |\n|---|---|\n| **loud** | quiet |\n", 800.0);
+        let loud = run_of(&l, "loud").expect("the cell text");
+        let quiet = run_of(&l, "quiet").expect("the plain cell");
+        assert_eq!(loud.face, Face::SansBold, "bold in a cell was lost");
+        assert_eq!(quiet.face, Face::Sans);
+    }
+
+    #[test]
+    fn a_table_does_not_swallow_the_paragraph_after_it() {
+        // The range bug: a still-open block absorbed the whole next paragraph
+        // because a Start tag carries the range of its entire element. The
+        // paragraph then got no block, and the revealed source showed both.
+        let src = "before\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nafter\n";
+        let d = parse(src);
+        let last = d.blocks.last().expect("a block");
+        assert_eq!(&src[last.source.clone()], "after\n");
+        assert!(
+            d.blocks.iter().any(|b| matches!(b.kind, Kind::TableRow { .. })),
+            "the table did not become rows"
+        );
+    }
+
+    #[test]
+    fn an_empty_cell_still_holds_its_column_open() {
+        let l = lay("| a |  | c |\n|---|---|---|\n| 1 | 2 | 3 |\n", 800.0);
+        let x = |t: &str| run_of(&l, t).map(|r| r.x).expect(t);
+        assert!(x("3") > x("2"), "an empty header cell collapsed its column");
     }
 
     // ---- clicking ----------------------------------------------------------
