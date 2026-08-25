@@ -1,0 +1,29 @@
+[package]
+name = "mdedit"
+version = "0.1.0"
+edition = "2021"
+description = "A markdown editor that renders, and opens instantly."
+license = "Proprietary"
+
+[dependencies]
+# The parser only. This crate lays text out itself rather than producing HTML,
+# so it takes the event stream and never builds a document tree it would then
+# have to walk again.
+pulldown-cmark = { version = "0.13", default-features = false }
+# Windowing across X11, Wayland, macOS and Windows.
+winit = "0.30"
+# A CPU framebuffer. Deliberately NOT wgpu: creating a GPU context is the single
+# largest startup cost in a modern GUI stack, and this program draws static text.
+softbuffer = "0.4"
+# A LAZY, zero-copy font reader. Not fontdue: that parses every glyph in the
+# face on load, which measured 36ms per face -- 95% of this program's startup,
+# paid to build outlines for glyphs no document uses. See `text.rs`.
+# exist -- see the note on fontconfig in `text.rs`.
+ab_glyph = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
