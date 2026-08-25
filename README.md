@@ -46,22 +46,43 @@ Speed decides the architecture rather than being tuned for afterwards.
 ## Use
 
 ```sh
-mdedit README.md          # read it
-mdedit --timing file.md   # and say where the time went
-mdedit --shot out.ppm f.md  # render one frame with no window at all
+mdedit README.md             # read it
+mdedit --edit README.md      # open straight into editing
+mdedit --timing file.md      # and say where the time went
+mdedit --shot out.ppm f.md   # render one frame with no window at all
 ```
 
-Arrow keys, PageUp/PageDown, Home/End and the wheel scroll. Escape closes.
+**Reading** — arrow keys, PageUp/PageDown, Home/End and the wheel scroll. `E`
+starts editing. Escape closes.
+
+**Editing** — the source, in monospace, with a caret. `Ctrl+S` saves, `Ctrl+Z`
+undoes, `Ctrl+Shift+Z` or `Ctrl+Y` redoes, Escape goes back to reading and
+re-renders. Tab inserts two spaces, because markdown's nesting is defined in
+spaces and a literal tab renders differently in every tool that reads it next.
+
+Escape with unsaved changes asks once before discarding them.
+
+### Two modes, not one
+
+Editing shows the source rather than an insertion point in the rendered view.
+Mapping a cursor between rendered text and the markdown behind it is the hard
+half of a WYSIWYG editor, and getting it subtly wrong puts someone's characters
+somewhere they did not ask for. A key to switch is cheap and never lies.
+
+Saving is a temp sibling plus a rename. `fs::write` truncates first, so a crash
+or a full disk between the truncate and the write leaves the truncated file --
+and it leaves it at the exact moment someone asked for their work to be kept.
 
 ## Limits, stated
 
-- **Read-only so far.** Editing and saving are the next slice.
 - **DejaVu, whatever you have installed**, and no coverage for scripts the
   embedded faces lack -- CJK, Arabic, Devanagari render as missing glyphs. The
   fix is to embed more coverage, not to start asking the system.
 - **Synthetic italics.** Sheared from the regular face rather than a true italic,
   because `fonts-dejavu-core` ships no oblique sans.
-- **Tables are parsed but not laid out yet.**
+- **Tables are parsed but not laid out yet** -- they render as their source text.
+- **No selection, no clipboard, no find.** The editing is a caret, characters and
+  undo. Enough to fix a line; not yet enough to restructure a document.
 - **The product now renders markdown twice** -- HTML in the console, this here --
   and the two can drift. Accepted because this opens arbitrary files rather than
   organisation content, so they never render the same document.

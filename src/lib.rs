@@ -30,6 +30,8 @@
 //! anything here.
 
 pub mod doc;
+pub mod edit;
+pub mod file;
 pub mod layout;
 pub mod render;
 pub mod text;

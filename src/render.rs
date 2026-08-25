@@ -9,8 +9,8 @@
 //! before any glyph is touched, so scrolling a long document costs the same as
 //! scrolling a short one.
 
-use crate::layout::{Ink, Laid};
-use crate::text::{Text, SHEAR};
+use crate::layout::{Ink, Laid, PAD};
+use crate::text::{Face, Text, CODE_LEADING, SHEAR};
 
 /// Colours, as `0x00RRGGBB` to match softbuffer's format.
 #[derive(Debug, Clone, Copy)]
@@ -22,6 +22,9 @@ pub struct Theme {
     pub link: u32,
     pub code: u32,
     pub code_bg: u32,
+    /// The status line's ground, and the caret.
+    pub bar: u32,
+    pub caret: u32,
 }
 
 impl Theme {
@@ -35,6 +38,8 @@ impl Theme {
         link: 0x00c9_6a63,
         code: 0x00d6_d6d6,
         code_bg: 0x0017_1717,
+        bar: 0x001b_1b1b,
+        caret: 0x00b6_3c35,
     };
 
     fn of(&self, ink: Ink) -> u32 {
@@ -218,6 +223,63 @@ mod tests {
     }
 
     #[test]
+    fn the_source_view_shows_the_source_and_a_caret() {
+        let mut text = Text::new();
+        let (w, h) = (500usize, 300usize);
+        let lines = vec!["# Heading".to_string(), "some **source**".to_string()];
+        let mut buf = vec![0u32; w * h];
+        let (top, lh) = draw_source(&lines, (1, 4), &mut text, &mut buf, w, h, 0.0, 16.0, &Theme::DARK);
+        assert!(ink_pixels(&buf, &Theme::DARK) > 200, "no source drawn");
+        assert!(buf.iter().any(|p| *p == Theme::DARK.caret), "no caret drawn");
+        assert!(top > 0.0 && lh > 0.0);
+    }
+
+    #[test]
+    fn the_caret_moves_with_the_cursor() {
+        // Otherwise it is decoration rather than a cursor, and typing appears to
+        // happen somewhere other than where it is shown.
+        let (w, h) = (500usize, 300usize);
+        let lines = vec!["aaaaaaaaaa".to_string()];
+        let caret_x = |col: usize| {
+            let mut text = Text::new();
+            let mut buf = vec![0u32; w * h];
+            draw_source(&lines, (0, col), &mut text, &mut buf, w, h, 0.0, 16.0, &Theme::DARK);
+            buf.iter()
+                .enumerate()
+                .filter(|(_, p)| **p == Theme::DARK.caret)
+                .map(|(i, _)| i % w)
+                .min()
+                .unwrap_or(0)
+        };
+        assert!(caret_x(6) > caret_x(0), "the caret did not follow the column");
+    }
+
+    #[test]
+    fn the_status_line_says_when_a_file_is_modified() {
+        let (w, h) = (700usize, 120usize);
+        let ink = |dirty: bool| {
+            let mut text = Text::new();
+            let mut buf = vec![0u32; w * h];
+            draw_status(&mut text, &mut buf, w, h, 16.0, &Theme::DARK, "notes.md", dirty, true, None);
+            buf.iter().filter(|p| **p == Theme::DARK.caret).count()
+        };
+        assert_eq!(ink(false), 0, "an unmodified file claimed to be modified");
+        assert!(ink(true) > 0, "a modified file said nothing");
+    }
+
+    #[test]
+    fn a_status_note_replaces_the_hint() {
+        let (w, h) = (700usize, 120usize);
+        let render = |note: Option<&str>| {
+            let mut text = Text::new();
+            let mut buf = vec![0u32; w * h];
+            draw_status(&mut text, &mut buf, w, h, 16.0, &Theme::DARK, "n.md", false, true, note);
+            buf
+        };
+        assert_ne!(render(None), render(Some("saved")), "the note changed nothing");
+    }
+
+    #[test]
     fn blending_is_bounded_at_both_ends() {
         assert_eq!(blend(0x00000000, 0x00ffffff, 0), 0x00000000);
         assert_eq!(blend(0x00000000, 0x00ffffff, 255), 0x00ffffff);
@@ -247,4 +309,154 @@ mod tests {
         };
         assert!(rightmost(true) > rightmost(false), "shear had no effect");
     }
+}
+
+/// Fill a rectangle, clipped to the buffer.
+fn fill(buf: &mut [u32], w: usize, h: usize, x: f32, y: f32, rw: f32, rh: f32, colour: u32) {
+    let x0 = x.round().max(0.0) as usize;
+    let y0 = y.round().max(0.0) as usize;
+    let x1 = ((x + rw).round().max(0.0) as usize).min(w);
+    let y1 = ((y + rh).round().max(0.0) as usize).min(h);
+    for row in y0..y1 {
+        let base = row * w;
+        for col in x0..x1 {
+            buf[base + col] = colour;
+        }
+    }
+}
+
+/// Draw one run of text at a baseline. Returns where the pen ended.
+fn draw_text(
+    text: &mut Text,
+    buf: &mut [u32],
+    w: usize,
+    h: usize,
+    x: f32,
+    baseline: f32,
+    s: &str,
+    face: Face,
+    px: f32,
+    colour: u32,
+) -> f32 {
+    let mut pen = x;
+    for ch in s.chars() {
+        if ch == ' ' {
+            pen += text.advance(face, ch, px);
+            continue;
+        }
+        let g = text.glyph(face, ch, px);
+        let (gx, gy) = (pen + g.left, baseline + g.top);
+        for row in 0..g.height {
+            let py = gy.round() as i64 + row as i64;
+            if py < 0 || py >= h as i64 {
+                continue;
+            }
+            let base = py as usize * w;
+            for col in 0..g.width {
+                let cov = g.bitmap[row * g.width + col];
+                if cov == 0 {
+                    continue;
+                }
+                let px_i = gx.round() as i64 + col as i64;
+                if px_i < 0 || px_i >= w as i64 {
+                    continue;
+                }
+                let i = base + px_i as usize;
+                buf[i] = blend(buf[i], colour, cov);
+            }
+        }
+        pen += g.advance;
+    }
+    pen
+}
+
+/// How tall the status line is at a given base size.
+pub fn status_height(base: f32) -> f32 {
+    base * 1.9
+}
+
+/// The source, as source: monospace lines with a caret.
+///
+/// Deliberately NOT the rendered view with an insertion point in it. Mapping a
+/// cursor between rendered text and the markdown that produced it is the hard
+/// part of a WYSIWYG editor, and getting it subtly wrong moves someone's
+/// characters somewhere they did not ask for. Showing the source while editing
+/// is honest about what is being changed, and switching back is one key.
+///
+/// Returns the caret's top and the line height, so the caller can keep it in view.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_source(
+    lines: &[String],
+    cursor: (usize, usize),
+    text: &mut Text,
+    buf: &mut [u32],
+    width: usize,
+    height: usize,
+    scroll: f32,
+    base: f32,
+    theme: &Theme,
+) -> (f32, f32) {
+    buf.fill(theme.bg);
+    let px = base * 0.95;
+    let lh = text.line_height_with(Face::Mono, px, CODE_LEADING);
+    let asc = text.ascent(Face::Mono, px);
+    let left = PAD;
+    let (cur_line, cur_col) = cursor;
+
+    for (i, line) in lines.iter().enumerate() {
+        let top = PAD + i as f32 * lh - scroll;
+        // Culled before any glyph is touched, so a long file costs what is on
+        // screen rather than what it contains.
+        if top + lh < 0.0 || top > height as f32 {
+            continue;
+        }
+        draw_text(text, buf, width, height, left, top + asc, line, Face::Mono, px, theme.code);
+    }
+
+    // The caret last, so it is never painted over by the line it sits in.
+    let caret_top = PAD + cur_line as f32 * lh;
+    let prefix: String = lines
+        .get(cur_line)
+        .map(|l| l.chars().take(cur_col).collect())
+        .unwrap_or_default();
+    let caret_x = left + text.width(Face::Mono, &prefix, px);
+    fill(buf, width, height, caret_x, caret_top - scroll, 2.0, lh, theme.caret);
+    (caret_top, lh)
+}
+
+/// One line at the bottom: what file, whether it is modified, and what to press.
+pub fn draw_status(
+    text: &mut Text,
+    buf: &mut [u32],
+    width: usize,
+    height: usize,
+    base: f32,
+    theme: &Theme,
+    name: &str,
+    dirty: bool,
+    editing: bool,
+    note: Option<&str>,
+) {
+    let bh = status_height(base);
+    let top = height as f32 - bh;
+    fill(buf, width, height, 0.0, top, width as f32, bh, theme.bar);
+
+    let px = base * 0.78;
+    let baseline = top + (bh + text.ascent(Face::Sans, px)) / 2.0 - base * 0.22;
+    let mut x = draw_text(
+        text, buf, width, height, PAD, baseline, name, Face::SansBold, px, theme.strong,
+    );
+    if dirty {
+        // A word, not a symbol. "modified" needs no key and cannot be mistaken
+        // for decoration the way a lone dot can.
+        x = draw_text(text, buf, width, height, x + base * 0.5, baseline, "modified", Face::Sans, px, theme.caret);
+    }
+    let hint = note.unwrap_or(if editing {
+        "editing  ·  Ctrl+S save  ·  Ctrl+Z undo  ·  Esc read"
+    } else {
+        "reading  ·  E edit  ·  Esc close"
+    });
+    let hw = text.width(Face::Sans, hint, px);
+    let hx = (width as f32 - PAD - hw).max(x + base);
+    draw_text(text, buf, width, height, hx, baseline, hint, Face::Sans, px, theme.dim);
 }

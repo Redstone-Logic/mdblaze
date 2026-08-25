@@ -25,12 +25,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use mdedit::doc;
+use mdedit::edit::Buffer;
+use mdedit::file;
 use mdedit::layout::{self, Laid};
 use mdedit::render::{self, Theme};
 use mdedit::text::Text;
 
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Modifiers, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
@@ -38,11 +40,32 @@ use winit::window::{Window, WindowId};
 /// Pixels per wheel notch, when the platform reports notches rather than pixels.
 const LINE_SCROLL: f32 = 48.0;
 
+/// How long a status message stays up before the hint returns.
+const NOTE_MS: u128 = 2_500;
+
+/// Reading, or changing.
+///
+/// Two modes rather than editing the rendered view directly. Mapping a cursor
+/// between rendered text and the markdown behind it is the hard half of a
+/// WYSIWYG editor, and getting it subtly wrong puts someone's characters
+/// somewhere they did not ask for. A key to switch is cheap and never lies.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Mode {
+    Read,
+    Edit,
+}
+
 struct App {
     t0: Instant,
     path: Option<std::path::PathBuf>,
-    source: String,
+    buffer: Buffer,
     text: Text,
+    mode: Mode,
+    mods: Modifiers,
+    note: Option<(String, Instant)>,
+    /// Set when Escape was pressed with unsaved changes. A second press closes.
+    confirm_discard: bool,
+    started: Instant,
     laid: Laid,
     /// The width the layout was computed for, so a resize that does not change
     /// the width does not redo it.
@@ -58,7 +81,7 @@ impl App {
     fn title(&self) -> String {
         match &self.path {
             Some(p) => p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
-            None => "markdown".to_string(),
+            None => "untitled".to_string(),
         }
     }
 
@@ -67,13 +90,61 @@ impl App {
         if (width - self.laid_for).abs() < 0.5 {
             return;
         }
-        let parsed = doc::parse(&self.source);
+        self.reflow(width);
+    }
+
+    /// Re-parse and re-lay out unconditionally. Only on leaving edit mode: doing
+    /// it per keystroke would parse the whole document on every character, which
+    /// is affordable but pointless while the source is what is on screen.
+    fn reflow(&mut self, width: f32) {
+        let parsed = doc::parse(&self.buffer.text());
         self.laid = layout::lay_out(&parsed, width, 16.0, &self.text);
         self.laid_for = width;
     }
 
+    fn ms(&self) -> u128 {
+        self.started.elapsed().as_millis()
+    }
+
+    fn say(&mut self, what: &str) {
+        self.note = Some((what.to_string(), Instant::now()));
+    }
+
+    fn save(&mut self) {
+        let Some(path) = self.path.clone() else {
+            self.say("no filename — open a file to save it");
+            return;
+        };
+        match file::save_atomic(&path, &self.buffer.text()) {
+            Ok(()) => {
+                self.buffer.mark_saved();
+                self.say("saved");
+            }
+            // Never silent. A save that failed and said nothing is how work is
+            // lost while someone believes it is safe.
+            Err(e) => self.say(&format!("could not save: {e}")),
+        }
+    }
+
     fn max_scroll(&self, height: f32) -> f32 {
-        (self.laid.height - height).max(0.0)
+        let view = (height - render::status_height(16.0)).max(1.0);
+        match self.mode {
+            Mode::Read => (self.laid.height - view).max(0.0),
+            Mode::Edit => {
+                let lh = self.text.line_height_with(mdedit::text::Face::Mono, 16.0 * 0.95, mdedit::text::CODE_LEADING);
+                (layout::PAD * 2.0 + self.buffer.lines().len() as f32 * lh - view).max(0.0)
+            }
+        }
+    }
+
+    /// Keep the caret on screen after a movement or an edit.
+    fn follow_caret(&mut self, height: f32, caret_top: f32, lh: f32) {
+        let view = (height - render::status_height(16.0)).max(1.0);
+        if caret_top < self.scroll {
+            self.scroll = caret_top;
+        } else if caret_top + lh > self.scroll + view {
+            self.scroll = caret_top + lh - view;
+        }
     }
 }
 
@@ -99,27 +170,103 @@ impl ApplicationHandler for App {
         match ev {
             WindowEvent::CloseRequested => el.exit(),
 
+            WindowEvent::ModifiersChanged(m) => self.mods = m,
+
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let size = window.inner_size();
                 let page = size.height as f32 * 0.9;
-                let max = self.max_scroll(size.height as f32);
-                let before = self.scroll;
-                match event.logical_key {
-                    Key::Named(NamedKey::Escape) => el.exit(),
-                    Key::Named(NamedKey::ArrowDown) => self.scroll += LINE_SCROLL,
-                    Key::Named(NamedKey::ArrowUp) => self.scroll -= LINE_SCROLL,
-                    Key::Named(NamedKey::PageDown) | Key::Named(NamedKey::Space) => {
-                        self.scroll += page
+                let ctrl = self.mods.state().control_key();
+                let shift = self.mods.state().shift_key();
+                let now = self.ms();
+
+                match (&event.logical_key, self.mode) {
+                    // ---- always ------------------------------------------
+                    (Key::Character(c), _) if ctrl && c.eq_ignore_ascii_case("s") => {
+                        self.save();
                     }
-                    Key::Named(NamedKey::PageUp) => self.scroll -= page,
-                    Key::Named(NamedKey::Home) => self.scroll = 0.0,
-                    Key::Named(NamedKey::End) => self.scroll = max,
+
+                    // ---- reading -----------------------------------------
+                    (Key::Character(c), Mode::Read) if c.eq_ignore_ascii_case("e") && !ctrl => {
+                        self.mode = Mode::Edit;
+                        self.scroll = 0.0;
+                        self.confirm_discard = false;
+                    }
+                    (Key::Named(NamedKey::Escape), Mode::Read) => {
+                        // Unsaved work is not discarded on one keypress. The
+                        // second press is the person saying they meant it.
+                        if self.buffer.is_dirty() && !self.confirm_discard {
+                            self.confirm_discard = true;
+                            self.say("unsaved — Ctrl+S to save, Esc again to discard");
+                        } else {
+                            el.exit();
+                        }
+                    }
+                    (Key::Named(NamedKey::ArrowDown), Mode::Read) => self.scroll += LINE_SCROLL,
+                    (Key::Named(NamedKey::ArrowUp), Mode::Read) => self.scroll -= LINE_SCROLL,
+                    (Key::Named(NamedKey::PageDown), Mode::Read)
+                    | (Key::Named(NamedKey::Space), Mode::Read) => self.scroll += page,
+                    (Key::Named(NamedKey::PageUp), Mode::Read) => self.scroll -= page,
+                    (Key::Named(NamedKey::Home), Mode::Read) => self.scroll = 0.0,
+                    (Key::Named(NamedKey::End), Mode::Read) => {
+                        self.scroll = self.max_scroll(size.height as f32)
+                    }
+
+                    // ---- editing -----------------------------------------
+                    (Key::Named(NamedKey::Escape), Mode::Edit) => {
+                        self.mode = Mode::Read;
+                        self.reflow(size.width as f32);
+                        self.scroll = 0.0;
+                    }
+                    (Key::Character(c), Mode::Edit) if ctrl && c.eq_ignore_ascii_case("z") => {
+                        // Ctrl+Shift+Z redoes, which is the other convention and
+                        // costs nothing to also accept.
+                        let moved = if shift { self.buffer.redo() } else { self.buffer.undo() };
+                        if !moved {
+                            self.say(if shift { "nothing to redo" } else { "nothing to undo" });
+                        }
+                    }
+                    (Key::Character(c), Mode::Edit) if ctrl && c.eq_ignore_ascii_case("y") => {
+                        if !self.buffer.redo() {
+                            self.say("nothing to redo");
+                        }
+                    }
+                    (Key::Named(NamedKey::Enter), Mode::Edit) => self.buffer.insert_newline(now),
+                    (Key::Named(NamedKey::Backspace), Mode::Edit) => self.buffer.backspace(now),
+                    (Key::Named(NamedKey::Delete), Mode::Edit) => self.buffer.delete(now),
+                    (Key::Named(NamedKey::Tab), Mode::Edit) => {
+                        // Two spaces, not a tab character: markdown's nesting is
+                        // defined in spaces and a literal tab renders differently
+                        // in every tool that reads it afterwards.
+                        self.buffer.insert_char(' ', now);
+                        self.buffer.insert_char(' ', now);
+                    }
+                    (Key::Named(NamedKey::ArrowLeft), Mode::Edit) => self.buffer.left(),
+                    (Key::Named(NamedKey::ArrowRight), Mode::Edit) => self.buffer.right(),
+                    (Key::Named(NamedKey::ArrowUp), Mode::Edit) => self.buffer.up(),
+                    (Key::Named(NamedKey::ArrowDown), Mode::Edit) => self.buffer.down(),
+                    (Key::Named(NamedKey::Home), Mode::Edit) => self.buffer.home(),
+                    (Key::Named(NamedKey::End), Mode::Edit) => self.buffer.end(),
+                    (Key::Named(NamedKey::Space), Mode::Edit) => self.buffer.insert_char(' ', now),
+                    (Key::Character(c), Mode::Edit) if !ctrl => {
+                        // What the layout produced, so an accented or composed
+                        // character arrives as itself rather than as the key that
+                        // happened to be under the finger.
+                        for ch in c.chars() {
+                            self.buffer.insert_char(ch, now);
+                        }
+                    }
                     _ => {}
                 }
-                self.scroll = self.scroll.clamp(0.0, max);
-                if self.scroll != before {
-                    window.request_redraw();
+
+                if self.mode == Mode::Read {
+                    self.scroll = self.scroll.clamp(0.0, self.max_scroll(size.height as f32));
                 }
+                // Any keypress that was not the second Escape means they did not
+                // mean to discard after all.
+                if !matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
+                    self.confirm_discard = false;
+                }
+                window.request_redraw();
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
@@ -150,21 +297,59 @@ impl ApplicationHandler for App {
                 // total, and a scroll position from before it can be past the end.
                 self.scroll = self.scroll.clamp(0.0, self.max_scroll(size.height as f32));
 
-                let Some(surface) = self.surface.as_mut() else {
-                    return;
-                };
-                surface.resize(w, h).expect("resize");
-                let mut buf = surface.buffer_mut().expect("buffer");
-                render::draw(
-                    &self.laid,
-                    &mut self.text,
-                    &mut buf,
-                    size.width as usize,
-                    size.height as usize,
-                    self.scroll,
-                    &Theme::DARK,
-                );
-                buf.present().expect("present");
+                // A note that has had its moment gives the hint back.
+                if self.note.as_ref().is_some_and(|(_, at)| at.elapsed().as_millis() > NOTE_MS) {
+                    self.note = None;
+                }
+
+                let (width, height) = (size.width as usize, size.height as usize);
+                let mode = self.mode;
+                let scroll = self.scroll;
+                let name = self.title();
+                let dirty = self.buffer.is_dirty();
+                let note = self.note.as_ref().map(|(t, _)| t.clone());
+
+                let mut caret: Option<(f32, f32)> = None;
+                {
+                    let surface = self.surface.as_mut().expect("surface");
+                    surface.resize(w, h).expect("resize");
+                    let mut buf = surface.buffer_mut().expect("buffer");
+                    match mode {
+                        Mode::Read => render::draw(
+                            &self.laid, &mut self.text, &mut buf, width, height, scroll, &Theme::DARK,
+                        ),
+                        Mode::Edit => {
+                            caret = Some(render::draw_source(
+                                self.buffer.lines(),
+                                (self.buffer.line, self.buffer.col),
+                                &mut self.text,
+                                &mut buf,
+                                width,
+                                height,
+                                scroll,
+                                16.0,
+                                &Theme::DARK,
+                            ));
+                        }
+                    }
+                    render::draw_status(
+                        &mut self.text, &mut buf, width, height, 16.0, &Theme::DARK,
+                        &name, dirty, mode == Mode::Edit, note.as_deref(),
+                    );
+                    buf.present().expect("present");
+                }
+
+                // Scrolling to the caret needs the layout the frame just used, so
+                // it happens after drawing and asks for one more frame only when
+                // the view actually has to move.
+                if let Some((top, lh)) = caret {
+                    let before = self.scroll;
+                    self.follow_caret(size.height as f32, top, lh);
+                    self.scroll = self.scroll.clamp(0.0, self.max_scroll(size.height as f32));
+                    if (self.scroll - before).abs() > 0.5 {
+                        window.request_redraw();
+                    }
+                }
 
                 if self.timing && !self.reported {
                     self.reported = true;
@@ -187,6 +372,7 @@ fn main() {
     let mut once = false;
     let mut shot = false;
     let mut shot_to: Option<std::path::PathBuf> = None;
+    let mut start_editing = false;
     for a in args.by_ref() {
         match a.as_str() {
             "--timing" => timing = true,
@@ -202,8 +388,10 @@ fn main() {
             // in review -- without a display, and so measuring does not require
             // flashing windows on someone's desktop.
             "--shot" => shot = true,
+            // Start in edit mode. Also what `--shot --edit` renders.
+            "--edit" => start_editing = true,
             "-h" | "--help" => {
-                println!("mdedit [--timing] [--once] [--shot out.ppm] <file.md>");
+                println!("mdedit [--timing] [--once] [--edit] [--shot out.ppm] <file.md>");
                 return;
             }
             other if shot && shot_to.is_none() => {
@@ -250,9 +438,21 @@ fn main() {
     if let Some(out) = shot_to {
         let (w, h) = (900usize, 1100usize);
         let mut text2 = Text::new();
-        let laid = layout::lay_out(&doc::parse(&source), w as f32, 16.0, &text2);
         let mut buf = vec![0u32; w * h];
-        render::draw(&laid, &mut text2, &mut buf, w, h, 0.0, &Theme::DARK);
+        let buffer = Buffer::from_str(&source);
+        if start_editing {
+            render::draw_source(
+                buffer.lines(), (2, 6), &mut text2, &mut buf, w, h, 0.0, 16.0, &Theme::DARK,
+            );
+        } else {
+            let laid = layout::lay_out(&doc::parse(&source), w as f32, 16.0, &text2);
+            render::draw(&laid, &mut text2, &mut buf, w, h, 0.0, &Theme::DARK);
+        }
+        render::draw_status(
+            &mut text2, &mut buf, w, h, 16.0, &Theme::DARK,
+            &path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "untitled".into()),
+            start_editing, start_editing, None,
+        );
         // Binary PPM: three bytes a pixel and a one-line header. No encoder, no
         // dependency, and every image tool reads it.
         let mut bytes = format!("P6\n{w} {h}\n255\n").into_bytes();
@@ -271,8 +471,13 @@ fn main() {
     let mut app = App {
         t0,
         path,
-        source,
+        buffer: Buffer::from_str(&source),
         text,
+        mode: if start_editing { Mode::Edit } else { Mode::Read },
+        mods: Modifiers::default(),
+        note: None,
+        confirm_discard: false,
+        started: Instant::now(),
         laid,
         laid_for: 900.0,
         scroll: 0.0,
