@@ -62,12 +62,26 @@ pub fn entry(exec: &str) -> String {
 
 /// A document with a corner turned, in the accent. Scalable, so it is one file
 /// for every size a desktop asks for.
-pub fn icon() -> String {
-    // The one icon, shared with the macOS bundle and the Windows registry -- see
-    // `assets/`. Vector here because a Linux desktop asks for whatever size it
-    // feels like and scalable is the only answer that is right at all of them.
-    include_str!("../../assets/icon.svg").to_string()
-}
+/// The icon, at every size a desktop asks for.
+///
+/// PNGs rather than one scalable SVG, because the mark is a rendered blaze with
+/// type over it -- there is no vector source to scale from, and tracing one
+/// would lose the thing that makes it look like anything.
+///
+/// The sizes are not the same picture resampled. Below 32 pixels the mark drops
+/// to a single `m`: two letters and a flame will not fit, the letters close up,
+/// and the blaze becomes a smudge behind them. See `assets/make-icons.py`.
+pub const ICONS: &[(u32, &[u8])] = &[
+    (16, include_bytes!("../../assets/icons/16.png")),
+    (22, include_bytes!("../../assets/icons/22.png")),
+    (24, include_bytes!("../../assets/icons/24.png")),
+    (32, include_bytes!("../../assets/icons/32.png")),
+    (48, include_bytes!("../../assets/icons/48.png")),
+    (64, include_bytes!("../../assets/icons/64.png")),
+    (128, include_bytes!("../../assets/icons/128.png")),
+    (256, include_bytes!("../../assets/icons/256.png")),
+    (512, include_bytes!("../../assets/icons/512.png")),
+];
 
 /// Read the value of `key` in `section` of an INI-ish desktop config file.
 fn ini_get(content: &str, section: &str, key: &str) -> Option<String> {
@@ -181,8 +195,8 @@ pub fn give_back_defaults(content: &str, previous: &[(String, Option<String>)]) 
 fn entry_path_for(name: &str) -> PathBuf {
     applications_dir().join(format!("{name}.desktop"))
 }
-fn icon_path_for(name: &str) -> PathBuf {
-    home().join(format!(".local/share/icons/hicolor/scalable/apps/{name}.svg"))
+fn icon_path_for(name: &str, size: u32) -> PathBuf {
+    home().join(format!(".local/share/icons/hicolor/{size}x{size}/apps/{name}.png"))
 }
 fn record_path_for(name: &str) -> PathBuf {
     home().join(format!(".local/share/{name}/replaced-defaults"))
@@ -204,7 +218,14 @@ fn sweep_former(said: &mut Vec<String>) -> Vec<(String, Option<String>)> {
         }
         let _ = std::fs::remove_file(&record);
         let _ = record.parent().map(std::fs::remove_dir);
-        let _ = std::fs::remove_file(icon_path_for(name));
+        for (size, _) in ICONS {
+            let _ = std::fs::remove_file(icon_path_for(name, *size));
+        }
+        // The former name may also have installed a scalable SVG, which this
+        // one no longer does.
+        let _ = std::fs::remove_file(
+            home().join(format!(".local/share/icons/hicolor/scalable/apps/{name}.svg")),
+        );
         let entry = entry_path_for(name);
         if entry.exists() {
             let _ = std::fs::remove_file(&entry);
@@ -246,8 +267,8 @@ use super::home;
 fn applications_dir() -> PathBuf {
     home().join(".local/share/applications")
 }
-fn icon_path() -> PathBuf {
-    home().join(".local/share/icons/hicolor/scalable/apps/mdblaze.svg")
+fn icon_path(size: u32) -> PathBuf {
+    icon_path_for(super::NAME, size)
 }
 fn mimeapps() -> PathBuf {
     home().join(".config/mimeapps.list")
@@ -318,12 +339,14 @@ pub(super) fn install() -> std::io::Result<Vec<String>> {
     std::fs::write(&entry_path, entry(&exe.to_string_lossy()))?;
     said.push(format!("wrote {}", entry_path.display()));
 
-    let ico = icon_path();
-    if let Some(p) = ico.parent() {
-        std::fs::create_dir_all(p)?;
+    for (size, bytes) in ICONS {
+        let ico = icon_path(*size);
+        if let Some(p) = ico.parent() {
+            std::fs::create_dir_all(p)?;
+        }
+        std::fs::write(&ico, bytes)?;
     }
-    std::fs::write(&ico, icon())?;
-    said.push(format!("wrote {}", ico.display()));
+    said.push(format!("wrote {} icon sizes under hicolor", ICONS.len()));
 
     let mimeapps_path = mimeapps();
     let before = std::fs::read_to_string(&mimeapps_path).unwrap_or_default();
@@ -365,9 +388,8 @@ pub(super) fn uninstall() -> std::io::Result<Vec<String>> {
         std::fs::remove_file(&entry_path)?;
         said.push(format!("removed {}", entry_path.display()));
     }
-    let ico = icon_path();
-    if ico.exists() {
-        std::fs::remove_file(&ico)?;
+    for (size, _) in ICONS {
+        let _ = std::fs::remove_file(icon_path(*size));
     }
 
     let record = record_path();
@@ -506,18 +528,27 @@ mod tests {
     }
 
     #[test]
-    fn the_icon_is_a_single_self_contained_svg() {
-        let i = icon();
-        assert!(i.starts_with("<svg"));
-        assert!(i.contains("</svg>"));
-        // Nothing FETCHED. The `xmlns` is a namespace identifier and is never
-        // dereferenced, so testing for the string "http" flags it and fails for
-        // a reason that has nothing to do with the icon. What would actually
-        // reach the network is a reference to another resource.
-        for fetches in ["xlink:href", "<image", "url(http", "src="] {
-            assert!(!i.contains(fetches), "the icon references {fetches}: {i}");
+    fn every_icon_size_is_a_real_png_of_that_size() {
+        // A mis-built or truncated icon is one that silently does not appear,
+        // with nothing said about it. The header carries the dimensions, so
+        // this also catches a size wired to the wrong file.
+        for (size, bytes) in ICONS {
+            assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "{size} is not a PNG");
+            let w = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+            let h = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+            assert_eq!((w, h), (*size, *size), "{size}.png is actually {w}x{h}");
         }
     }
+
+    #[test]
+    fn the_icon_covers_the_sizes_a_desktop_asks_for() {
+        // 16 and 24 are what a file list and a taskbar use, and they are the
+        // ones a "just ship 512 and let it scale" icon gets wrong.
+        for want in [16, 24, 32, 48, 256] {
+            assert!(ICONS.iter().any(|(s, _)| *s == want), "no {want}px icon");
+        }
+    }
+
     // ---- the rename ----------------------------------------------------
 
     #[test]
@@ -581,7 +612,7 @@ mod tests {
         // the sweep would silently miss two of its three files.
         for n in FORMER_NAMES {
             assert!(entry_path_for(n).to_string_lossy().ends_with(&format!("{n}.desktop")));
-            assert!(icon_path_for(n).to_string_lossy().ends_with(&format!("{n}.svg")));
+            assert!(icon_path_for(n, 48).to_string_lossy().ends_with(&format!("{n}.png")));
             assert!(record_path_for(n).to_string_lossy().contains(*n));
         }
     }
@@ -598,7 +629,7 @@ mod tests {
         // stem or the desktop shows a generic page instead.
         let e = entry("/usr/local/bin/mdblaze");
         assert!(e.contains("Icon=mdblaze"), "{e}");
-        assert!(icon_path().to_string_lossy().ends_with("mdblaze.svg"));
+        assert!(icon_path(48).to_string_lossy().ends_with("48x48/apps/mdblaze.png"));
         assert!(DESKTOP_ID.starts_with("mdblaze"));
     }
 

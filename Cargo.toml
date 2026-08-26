@@ -12,7 +12,10 @@ categories = ["text-editors", "gui", "text-processing"]
 # The Noto faces are compiled in and are SIL OFL 1.1, not MIT/Apache. The SPDX
 # field above describes the CODE, which is the convention; see NOTICE for what
 # the binary actually contains and what travels with it.
-exclude = ["/docs", "/tests/fixtures", "*.ppm", "assets/make-icons.py"]
+# The masters are the artwork but the build does not read them -- only the
+# derived icons are compiled in. No need to ship 600KB of PNG to every
+# `cargo install`.
+exclude = ["/docs", "/tests/fixtures", "*.ppm", "assets/make-icons.py", "assets/icon-master*.png"]
 
 [dependencies]
 # The parser only. This crate lays text out itself rather than producing HTML,
