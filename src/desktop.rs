@@ -31,7 +31,19 @@ use std::path::{Path, PathBuf};
 pub const MIMES: &[&str] = &["text/markdown", "text/x-markdown"];
 
 /// The basename of the entry, which is also its id in `mimeapps.list`.
-pub const DESKTOP_ID: &str = "mdedit.desktop";
+pub const DESKTOP_ID: &str = "mdblaze.desktop";
+
+/// Names this program has shipped under before.
+///
+/// A rename is not just a string change once the program has installed itself
+/// on somebody's machine. The old name left a `.desktop` file, an icon, and --
+/// worst of all -- a line in `mimeapps.list` saying that markdown belongs to it.
+/// Install the new name without touching any of that and the desktop has two
+/// entries claiming the same file type, one of them pointing at a binary that
+/// may not exist any more, and which one wins is up to the desktop.
+///
+/// So installing sweeps the former names out. The list only ever grows.
+pub const FORMER_NAMES: &[&str] = &["mdedit"];
 
 /// Quote a path for a `.desktop` `Exec` line if it needs it.
 fn exec_quote(p: &str) -> String {
@@ -47,11 +59,11 @@ pub fn entry(exec: &str) -> String {
     format!(
         "[Desktop Entry]\n\
          Type=Application\n\
-         Name=mdedit\n\
+         Name=mdblaze\n\
          GenericName=Markdown Editor\n\
          Comment=A markdown editor that renders, and opens instantly\n\
          Exec={} %f\n\
-         Icon=mdedit\n\
+         Icon=mdblaze\n\
          Terminal=false\n\
          Categories=Utility;TextEditor;\n\
          MimeType={};\n\
@@ -184,6 +196,70 @@ pub fn give_back_defaults(content: &str, previous: &[(String, Option<String>)]) 
     out
 }
 
+/// Where a name -- this one or a former one -- keeps its three files.
+fn entry_path_for(name: &str) -> PathBuf {
+    applications_dir().join(format!("{name}.desktop"))
+}
+fn icon_path_for(name: &str) -> PathBuf {
+    home().join(format!(".local/share/icons/hicolor/scalable/apps/{name}.svg"))
+}
+fn record_path_for(name: &str) -> PathBuf {
+    home().join(format!(".local/share/{name}/replaced-defaults"))
+}
+
+/// Take a former name's files off the disk, and answer what IT displaced.
+///
+/// The record is the part that matters. When the old name installed itself it
+/// wrote down what markdown used to open with -- a browser, an editor, nothing
+/// at all -- so that uninstalling could give it back. That fact belongs to the
+/// user, not to the name, so it is carried across rather than deleted with the
+/// rest.
+fn sweep_former(said: &mut Vec<String>) -> Vec<(String, Option<String>)> {
+    let mut inherited = Vec::new();
+    for name in FORMER_NAMES {
+        let record = record_path_for(name);
+        if let Ok(text) = std::fs::read_to_string(&record) {
+            inherited = parse_record(&text);
+        }
+        let _ = std::fs::remove_file(&record);
+        let _ = record.parent().map(std::fs::remove_dir);
+        let _ = std::fs::remove_file(icon_path_for(name));
+        let entry = entry_path_for(name);
+        if entry.exists() {
+            let _ = std::fs::remove_file(&entry);
+            said.push(format!("removed the former {name} entry at {}", entry.display()));
+        }
+    }
+    inherited
+}
+
+/// Rewrite a captured "what was here before" list so nothing in it names a
+/// former identity.
+///
+/// Without this, installing over an older name records that markdown used to
+/// belong to `mdedit.desktop` -- and uninstalling would then dutifully hand the
+/// association back to a `.desktop` file that was just deleted, leaving markdown
+/// opening with nothing. What the user actually wants back is whatever came
+/// before the FIRST of our names, which is what the old record holds.
+fn forget_former(
+    previous: Vec<(String, Option<String>)>,
+    inherited: &[(String, Option<String>)],
+) -> Vec<(String, Option<String>)> {
+    let ours: Vec<String> =
+        FORMER_NAMES.iter().map(|n| format!("{n}.desktop")).chain([DESKTOP_ID.to_string()]).collect();
+    previous
+        .into_iter()
+        .map(|(mime, was)| {
+            let stale = was.as_deref().is_some_and(|w| ours.iter().any(|o| o == w));
+            if !stale {
+                return (mime, was);
+            }
+            let older = inherited.iter().find(|(m, _)| *m == mime).and_then(|(_, v)| v.clone());
+            (mime, older)
+        })
+        .collect()
+}
+
 fn home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
 }
@@ -192,14 +268,14 @@ fn applications_dir() -> PathBuf {
     home().join(".local/share/applications")
 }
 fn icon_path() -> PathBuf {
-    home().join(".local/share/icons/hicolor/scalable/apps/mdedit.svg")
+    home().join(".local/share/icons/hicolor/scalable/apps/mdblaze.svg")
 }
 fn mimeapps() -> PathBuf {
     home().join(".config/mimeapps.list")
 }
 /// Where the replaced defaults are remembered, so uninstall can restore them.
 fn record_path() -> PathBuf {
-    home().join(".local/share/mdedit/replaced-defaults")
+    home().join(".local/share/mdblaze/replaced-defaults")
 }
 
 fn serialise_record(previous: &[(String, Option<String>)]) -> String {
@@ -244,6 +320,11 @@ pub fn install() -> std::io::Result<Vec<String>> {
         ));
     }
 
+    // First, so the report reads in the order things happened -- and so a
+    // former name's files are gone before ours are written, rather than both
+    // existing for the width of a few syscalls.
+    let inherited = sweep_former(&mut said);
+
     let apps = applications_dir();
     std::fs::create_dir_all(&apps)?;
     let entry_path = apps.join(DESKTOP_ID);
@@ -260,6 +341,7 @@ pub fn install() -> std::io::Result<Vec<String>> {
     let mimeapps_path = mimeapps();
     let before = std::fs::read_to_string(&mimeapps_path).unwrap_or_default();
     let (after, previous) = take_defaults(&before, DESKTOP_ID);
+    let previous = forget_former(previous, &inherited);
     if let Some(p) = mimeapps_path.parent() {
         std::fs::create_dir_all(p)?;
     }
@@ -274,9 +356,9 @@ pub fn install() -> std::io::Result<Vec<String>> {
 
     for (m, was) in &previous {
         match was {
-            Some(w) if w != DESKTOP_ID => said.push(format!("{m} was {w}, now mdedit")),
-            Some(_) => said.push(format!("{m} already mdedit")),
-            None => said.push(format!("{m} had no default, now mdedit")),
+            Some(w) if w != DESKTOP_ID => said.push(format!("{m} was {w}, now mdblaze")),
+            Some(_) => said.push(format!("{m} already mdblaze")),
+            None => said.push(format!("{m} had no default, now mdblaze")),
         }
     }
 
@@ -288,6 +370,9 @@ pub fn install() -> std::io::Result<Vec<String>> {
 pub fn uninstall() -> std::io::Result<Vec<String>> {
     let mut said = Vec::new();
     let apps = applications_dir();
+    // A machine that still carries a former name's leftovers should come out of
+    // this clean, not half-uninstalled under a name nobody typed.
+    sweep_former(&mut said);
     let entry_path = apps.join(DESKTOP_ID);
     if entry_path.exists() {
         std::fs::remove_file(&entry_path)?;
@@ -337,22 +422,22 @@ mod tests {
     fn the_entry_declares_both_markdown_types() {
         // Only `text/markdown` means the association silently does nothing on any
         // machine whose shared-mime-info still says `text/x-markdown`.
-        let e = entry("/usr/local/bin/mdedit");
+        let e = entry("/usr/local/bin/mdblaze");
         assert!(e.contains("MimeType=text/markdown;text/x-markdown;"), "{e}");
     }
 
     #[test]
     fn the_entry_passes_the_file_it_was_opened_with() {
-        let e = entry("/usr/local/bin/mdedit");
-        assert!(e.contains("Exec=/usr/local/bin/mdedit %f"), "{e}");
+        let e = entry("/usr/local/bin/mdblaze");
+        assert!(e.contains("Exec=/usr/local/bin/mdblaze %f"), "{e}");
     }
 
     #[test]
     fn a_path_with_spaces_is_quoted() {
         // Unquoted, the desktop splits the path and launches something that does
         // not exist -- and the failure is a silent no-op on double-click.
-        let e = entry("/home/a b/bin/mdedit");
-        assert!(e.contains("Exec=\"/home/a b/bin/mdedit\" %f"), "{e}");
+        let e = entry("/home/a b/bin/mdblaze");
+        assert!(e.contains("Exec=\"/home/a b/bin/mdblaze\" %f"), "{e}");
     }
 
     #[test]
@@ -361,40 +446,40 @@ mod tests {
         // Rewriting it from a parsed model would drop whatever this code does not
         // model, which is how a tool breaks an unrelated association.
         let before = "[Default Applications]\ntext/html=firefox.desktop\nx-scheme-handler/http=firefox.desktop\n";
-        let after = ini_set(before, SECTION, "text/markdown", Some("mdedit.desktop"));
+        let after = ini_set(before, SECTION, "text/markdown", Some("mdblaze.desktop"));
         assert!(after.contains("text/html=firefox.desktop"));
         assert!(after.contains("x-scheme-handler/http=firefox.desktop"));
-        assert!(after.contains("text/markdown=mdedit.desktop"));
+        assert!(after.contains("text/markdown=mdblaze.desktop"));
     }
 
     #[test]
     fn setting_an_existing_key_replaces_it_rather_than_adding_a_second() {
         let before = "[Default Applications]\ntext/markdown=gedit.desktop\n";
-        let after = ini_set(before, SECTION, "text/markdown", Some("mdedit.desktop"));
+        let after = ini_set(before, SECTION, "text/markdown", Some("mdblaze.desktop"));
         assert_eq!(after.matches("text/markdown=").count(), 1, "{after}");
-        assert!(after.contains("text/markdown=mdedit.desktop"));
+        assert!(after.contains("text/markdown=mdblaze.desktop"));
     }
 
     #[test]
     fn a_key_is_written_into_its_own_section_not_the_next_one() {
         let before = "[Default Applications]\ntext/html=a.desktop\n\n[Added Associations]\ntext/html=a.desktop;\n";
-        let after = ini_set(before, SECTION, "text/markdown", Some("mdedit.desktop"));
+        let after = ini_set(before, SECTION, "text/markdown", Some("mdblaze.desktop"));
         let defaults = after.split("[Added Associations]").next().expect("section");
-        assert!(defaults.contains("text/markdown=mdedit.desktop"), "landed in the wrong section: {after}");
+        assert!(defaults.contains("text/markdown=mdblaze.desktop"), "landed in the wrong section: {after}");
     }
 
     #[test]
     fn a_missing_section_is_created() {
-        let after = ini_set("", SECTION, "text/markdown", Some("mdedit.desktop"));
+        let after = ini_set("", SECTION, "text/markdown", Some("mdblaze.desktop"));
         assert!(after.contains(SECTION));
-        assert!(after.contains("text/markdown=mdedit.desktop"));
+        assert!(after.contains("text/markdown=mdblaze.desktop"));
     }
 
     #[test]
     fn taking_the_default_records_what_it_replaced() {
         let before = "[Default Applications]\ntext/markdown=org.gnome.TextEditor.desktop\n";
         let (after, previous) = take_defaults(before, DESKTOP_ID);
-        assert!(after.contains("text/markdown=mdedit.desktop"));
+        assert!(after.contains("text/markdown=mdblaze.desktop"));
         assert_eq!(
             previous[0],
             ("text/markdown".to_string(), Some("org.gnome.TextEditor.desktop".to_string()))
@@ -406,7 +491,7 @@ mod tests {
         // The property that makes this safe to try: what was taken is given back.
         let before = "[Default Applications]\ntext/html=firefox.desktop\ntext/markdown=org.gnome.TextEditor.desktop\n";
         let (taken, previous) = take_defaults(before, DESKTOP_ID);
-        assert!(taken.contains("text/markdown=mdedit.desktop"));
+        assert!(taken.contains("text/markdown=mdblaze.desktop"));
         let restored = give_back_defaults(&taken, &previous);
         assert!(restored.contains("text/markdown=org.gnome.TextEditor.desktop"), "{restored}");
         assert!(restored.contains("text/html=firefox.desktop"), "an unrelated key was lost");
@@ -418,7 +503,7 @@ mod tests {
         // have none after, or uninstalling leaves a handler nobody chose.
         let before = "[Default Applications]\ntext/html=firefox.desktop\n";
         let (taken, previous) = take_defaults(before, DESKTOP_ID);
-        assert!(taken.contains("text/markdown=mdedit.desktop"));
+        assert!(taken.contains("text/markdown=mdblaze.desktop"));
         let restored = give_back_defaults(&taken, &previous);
         assert!(!restored.contains("text/markdown="), "left behind: {restored}");
         assert!(!restored.contains("text/x-markdown="), "left behind: {restored}");
@@ -446,4 +531,72 @@ mod tests {
             assert!(!i.contains(fetches), "the icon references {fetches}: {i}");
         }
     }
+    // ---- the rename ----------------------------------------------------
+
+    #[test]
+    fn a_former_name_is_never_handed_the_association_back() {
+        // The failure this prevents: install over `mdedit`, which captures
+        // "markdown used to be mdedit.desktop", then uninstall -- which gives
+        // markdown back to a .desktop file that was deleted during the install.
+        // Double-clicking a file then opens nothing at all.
+        let captured = vec![("text/markdown".to_string(), Some("mdedit.desktop".to_string()))];
+        let inherited = vec![("text/markdown".to_string(), Some("firefox.desktop".to_string()))];
+        let out = forget_former(captured, &inherited);
+        assert_eq!(out, vec![("text/markdown".to_string(), Some("firefox.desktop".to_string()))]);
+    }
+
+    #[test]
+    fn a_real_previous_default_is_left_exactly_as_it_was() {
+        // The common case, and the one the laundering must not touch.
+        let captured = vec![("text/markdown".to_string(), Some("okular.desktop".to_string()))];
+        let out = forget_former(captured, &[]);
+        assert_eq!(out[0].1, Some("okular.desktop".to_string()));
+    }
+
+    #[test]
+    fn installing_over_a_former_name_that_displaced_nothing_still_displaces_nothing() {
+        // `mdedit` took markdown when it had no default. After the rename,
+        // uninstalling must leave it with no default -- not with `mdedit`.
+        let captured = vec![("text/markdown".to_string(), Some("mdedit.desktop".to_string()))];
+        let out = forget_former(captured, &[]);
+        assert_eq!(out[0].1, None, "resurrected a name that no longer exists");
+    }
+
+    #[test]
+    fn our_own_id_is_laundered_too_so_reinstalling_is_not_a_trap() {
+        // Installing twice captures "markdown was mdblaze.desktop". Recording
+        // that would make uninstall a no-op that leaves us as the default
+        // forever.
+        let captured = vec![("text/markdown".to_string(), Some(DESKTOP_ID.to_string()))];
+        let inherited = vec![("text/markdown".to_string(), Some("nvim.desktop".to_string()))];
+        assert_eq!(forget_former(captured, &inherited)[0].1, Some("nvim.desktop".to_string()));
+    }
+
+    #[test]
+    fn every_former_name_has_the_three_files_it_needs_swept() {
+        // If a name were added to the list without its paths deriving from it,
+        // the sweep would silently miss two of its three files.
+        for n in FORMER_NAMES {
+            assert!(entry_path_for(n).to_string_lossy().ends_with(&format!("{n}.desktop")));
+            assert!(icon_path_for(n).to_string_lossy().ends_with(&format!("{n}.svg")));
+            assert!(record_path_for(n).to_string_lossy().contains(*n));
+        }
+    }
+
+    #[test]
+    fn the_current_name_is_not_in_the_list_of_former_ones() {
+        // It would sweep its own files away mid-install.
+        assert!(!FORMER_NAMES.contains(&"mdblaze"));
+    }
+
+    #[test]
+    fn the_entry_and_the_icon_agree_on_the_name() {
+        // `Icon=` names an icon by stem, and the file written must have that
+        // stem or the desktop shows a generic page instead.
+        let e = entry("/usr/local/bin/mdblaze");
+        assert!(e.contains("Icon=mdblaze"), "{e}");
+        assert!(icon_path().to_string_lossy().ends_with("mdblaze.svg"));
+        assert!(DESKTOP_ID.starts_with("mdblaze"));
+    }
+
 }

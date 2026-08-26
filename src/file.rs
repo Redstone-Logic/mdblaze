@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 /// rename cannot do and which stops being atomic.
 fn temp_beside(path: &Path) -> PathBuf {
     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    let tmp = format!(".{name}.mdedit-{}", std::process::id());
+    let tmp = format!(".{name}.mdblaze-{}", std::process::id());
     path.with_file_name(tmp)
 }
 
@@ -73,7 +73,7 @@ mod tests {
     use super::*;
 
     fn tmpdir() -> PathBuf {
-        let p = std::env::temp_dir().join(format!("mdedit-test-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let p = std::env::temp_dir().join(format!("mdblaze-test-{}-{:?}", std::process::id(), std::thread::current().id()));
         std::fs::create_dir_all(&p).expect("tempdir");
         p
     }

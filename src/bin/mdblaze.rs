@@ -31,14 +31,14 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use mdedit::desktop;
-use mdedit::doc;
-use mdedit::edit::Buffer;
-use mdedit::file;
-use mdedit::layout::{self, Editing, Laid};
-use mdedit::media::Media;
-use mdedit::render::{self, Scaled, Theme};
-use mdedit::text::Text;
+use mdblaze::desktop;
+use mdblaze::doc;
+use mdblaze::edit::Buffer;
+use mdblaze::file;
+use mdblaze::layout::{self, Editing, Laid};
+use mdblaze::media::Media;
+use mdblaze::render::{self, Scaled, Theme};
+use mdblaze::text::Text;
 
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Modifiers, MouseButton, MouseScrollDelta, WindowEvent};
@@ -60,7 +60,7 @@ const NOTE_MS: u128 = 2_500;
 /// who has moved on and pressed Escape for an unrelated reason.
 const DISCARD_MS: u128 = 1_500;
 
-const BASE: f32 = mdedit::text::BODY_PX;
+const BASE: f32 = mdblaze::text::BODY_PX;
 
 /// How the person asked to close, so the warning can name that gesture back to
 /// them rather than describing a different one.
@@ -439,7 +439,7 @@ fn report(r: std::io::Result<Vec<String>>) {
             }
         }
         Err(e) => {
-            eprintln!("mdedit: {e}");
+            eprintln!("mdblaze: {e}");
             std::process::exit(1);
         }
     }
@@ -484,9 +484,9 @@ fn main() {
             }
             "-h" | "--help" => {
                 println!(
-                    "mdedit [--timing] [--once] [--shot out.ppm [--at BYTE]] <file.md>\n\
-                     mdedit --install-handler     open .md files by double-click\n\
-                     mdedit --uninstall-handler   and give the association back"
+                    "mdblaze [--timing] [--once] [--shot out.ppm [--at BYTE]] <file.md>\n\
+                     mdblaze --install-handler     open .md files by double-click\n\
+                     mdblaze --uninstall-handler   and give the association back"
                 );
                 return;
             }
@@ -503,11 +503,11 @@ fn main() {
         Some(p) => match std::fs::read_to_string(p) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("mdedit: {}: {e}", p.display());
+                eprintln!("mdblaze: {}: {e}", p.display());
                 std::process::exit(1);
             }
         },
-        None => "# mdedit\n\nPass a markdown file to open it.\n".to_string(),
+        None => "# mdblaze\n\nPass a markdown file to open it.\n".to_string(),
     };
 
     let text = Text::new();

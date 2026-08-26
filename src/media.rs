@@ -222,7 +222,7 @@ mod tests {
 
     fn dir() -> PathBuf {
         let p = std::env::temp_dir()
-            .join(format!("mdedit-media-{}-{:?}", std::process::id(), std::thread::current().id()));
+            .join(format!("mdblaze-media-{}-{:?}", std::process::id(), std::thread::current().id()));
         std::fs::create_dir_all(&p).expect("tempdir");
         p
     }

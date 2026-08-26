@@ -65,7 +65,7 @@ const PATHS: &[&str] = &[
 /// Not a user preference -- there is exactly one colour emoji font on a machine
 /// and choosing between designs is not a decision worth a setting. It exists so
 /// a test can point at a known file and so a bundle can ship its own.
-const OVERRIDE: &str = "MDEDIT_EMOJI_FONT";
+const OVERRIDE: &str = "MDBLAZE_EMOJI_FONT";
 
 /// Is this a character a colour emoji font might have a picture for?
 ///

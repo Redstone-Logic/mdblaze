@@ -5,10 +5,10 @@
 //! buffer is correct, the writer is correct, and what reaches the disk is
 //! neither.
 
-use mdedit::{doc, edit::Buffer, file};
+use mdblaze::{doc, edit::Buffer, file};
 
 fn tmp(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("mdedit-rt-{}", std::process::id()));
+    let d = std::env::temp_dir().join(format!("mdblaze-rt-{}", std::process::id()));
     std::fs::create_dir_all(&d).expect("tempdir");
     d.join(name)
 }

@@ -1,4 +1,4 @@
-# mdedit
+# mdblaze
 
 A markdown editor that renders, and opens instantly.
 
@@ -51,14 +51,19 @@ Speed decides the architecture rather than being tuned for afterwards.
 ## Use
 
 ```sh
-mdedit --install-handler     # open .md by double-click
-mdedit --uninstall-handler   # and give the association back
+mdblaze --install-handler     # open .md by double-click
+mdblaze --uninstall-handler   # and give the association back
 
-mdedit README.md             # read it
-mdedit --edit README.md      # open straight into editing
-mdedit --timing file.md      # and say where the time went
-mdedit --shot out.ppm f.md   # render one frame with no window at all
+mdblaze README.md             # read it
+mdblaze --edit README.md      # open straight into editing
+mdblaze --timing file.md      # and say where the time went
+mdblaze --shot out.ppm f.md   # render one frame with no window at all
 ```
+
+`--install-handler` also sweeps out any entry left by a name this program used
+to ship under, and carries that install's record of what it displaced across --
+so uninstalling gives markdown back to whatever had it *before* any version of
+this, rather than to a `.desktop` file that no longer exists.
 
 The document is always rendered. The block your caret is in shows its markdown
 so you can change it, and the moment the caret leaves, that block renders again.
