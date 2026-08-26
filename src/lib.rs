@@ -30,11 +30,14 @@
 //!     here put together, to draw static text.
 //!   - **No index, no vault, no workspace.** One file, opened.
 //!
-//! Measured on the machine this was written on: parsing 36KB of markdown takes
-//! 0.35ms and putting a window on screen with raw X11 takes 0.2ms. The budget
-//! is not spent on the work; it is spent on the toolkit, which is why the
-//! windowing lives behind its own edge and can be replaced without touching
-//! anything here.
+//! Measured on the machine this was written on: a 10KB document parses in
+//! 0.07ms and lays out in 0.17ms, and the whole program's own work from process
+//! start to first frame is 0.61ms. The first frame reaches the screen at 24.6ms.
+//!
+//! The budget is not spent on the work. It is spent in `EventLoop::new()`, 13ms
+//! of which is X11 parsing its 5,172-line Compose table so that dead keys work.
+//! That is why the windowing lives behind its own edge and can be replaced
+//! without touching anything here; see the README for the measurements.
 
 pub mod code;
 pub mod desktop;

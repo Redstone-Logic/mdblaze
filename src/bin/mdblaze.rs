@@ -218,12 +218,20 @@ impl ApplicationHandler for App {
             // about 683px; the rest is margin so the window is not painted into
             // a corner. Prose still stops at its own, narrower measure.
             .with_inner_size(winit::dpi::LogicalSize::new(940.0, 820.0));
+        let t_win = Instant::now();
         let w = Arc::new(el.create_window(attrs).expect("could not open a window"));
+        if self.timing {
+            eprintln!("window:     {:.2} ms", t_win.elapsed().as_secs_f64() * 1000.0);
+        }
         // The window is a document from edge to edge, so the pointer says so
         // everywhere rather than changing shape over text.
         w.set_cursor(CursorIcon::Text);
+        let t_surf = Instant::now();
         let ctx = softbuffer::Context::new(w.clone()).expect("no drawing context");
         let surface = softbuffer::Surface::new(&ctx, w.clone()).expect("no drawing surface");
+        if self.timing {
+            eprintln!("surface:    {:.2} ms", t_surf.elapsed().as_secs_f64() * 1000.0);
+        }
         self.window = Some(w);
         self.surface = Some(surface);
     }
@@ -566,7 +574,14 @@ fn main() {
         return;
     }
 
+    // Where the budget actually goes. Everything above this line is this
+    // program's own work and is measured in fractions of a millisecond; almost
+    // all of what a person waits for is below it, in the toolkit.
+    let t_el = Instant::now();
     let el = EventLoop::new().expect("no event loop");
+    if timing {
+        eprintln!("event loop: {:.2} ms", t_el.elapsed().as_secs_f64() * 1000.0);
+    }
     el.set_control_flow(ControlFlow::Wait);
     let mut app = App {
         t0,

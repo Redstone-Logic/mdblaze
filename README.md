@@ -9,22 +9,48 @@ should cost neither.
 
 ## Measured
 
-On the machine it was written on, a 900x760 window:
+Minimum of twelve runs on the machine it was written on, a 900x760 window.
 
-| | small document | 36 KB document |
+| | 10 KB document | 142 KB document |
 |---|---|---|
-| read the file | 0.05 ms | 0.08 ms |
-| reference the fonts | 0.08 ms | 0.09 ms |
-| parse | 0.05 ms | 0.8 ms |
-| lay out | 0.03 ms | 4.5 ms |
-| **our work** | **0.21 ms** | **5.5 ms** |
-| first frame on screen | ~30 ms | ~38 ms |
+| parse | 0.07 ms | 0.32 ms |
+| lay out | 0.17 ms | 1.63 ms |
+| draw a frame | 0.40 ms | 0.45 ms |
+| **our work, start to first frame** | **0.61 ms** | **3.81 ms** |
+| first frame on screen | 24.6 ms | 31.3 ms |
 
-Everything after "our work" is the windowing toolkit. `winit` costs about 35ms
-before a frame is possible, most of it compiling a keyboard layout, loading
-cursor themes and enumerating monitors -- none of which a document being read
-needs. Raw X11 puts a window up in 0.2ms, so that 35ms is claimable, at the price
-of a backend per platform.
+Drawing is flat because only what is on screen is drawn; a long document scrolls
+at the cost of a short one.
+
+### Where the wait actually is
+
+Run with `--timing` and it reports each phase. On the 10 KB document:
+
+```
+read+parse+layout   0.61 ms     <- everything this program does
+event loop         16.29 ms     <- winit
+window              0.67 ms
+surface             0.19 ms
+```
+
+So **96% of what a person waits for is the toolkit**, and almost all of that is
+one call: `EventLoop::new()`.
+
+Thirteen of those milliseconds are `xkb_compose_table_new_from_locale`, which
+parses `/usr/share/X11/locale/en_US.UTF-8/Compose` -- 5,172 lines -- on the way
+up. Proved by measuring against `XCOMPOSEFILE=/dev/null`, which takes the event
+loop from 19.4 ms to 6.4 ms.
+
+That table is what makes dead keys work: `Compose` `'` `e` giving `é`. Typing an
+accented character into a document is an ordinary thing to want, so this is
+**not** disabled to win the 13 ms. winit builds the table eagerly, with no knob
+to defer it, so the fix is upstream or in a hand-written backend -- raw X11 puts
+a window up in 0.2 ms, at the price of a backend per platform and a compose
+implementation of one's own.
+
+It is written down here because a claim of "30 ms" that is really "1 ms of us and
+29 ms of a dependency" is a claim that stops being true the moment somebody
+believes it.
 
 ## The shape, and why
 

@@ -132,6 +132,37 @@ struct Key {
     quarters: u32,
 }
 
+/// Advances for the printable ASCII of one face at one size.
+///
+/// A flat array rather than a map because of what the lookup replaces. Asking
+/// the font is a binary search of the character map followed by a metrics
+/// lookup, and it happens for EVERY CHARACTER of every word, twice -- once to
+/// decide whether the word fits on the line and once to place it. Measured at
+/// 28ns a character, which was 72% of laying out a document.
+///
+/// A `HashMap` would only have halved it; hashing is not free either. Indexing
+/// an array by the byte is one load. The row itself is found by a short linear
+/// scan, because a document uses about six (face, size) pairs -- body, bold,
+/// italic, mono, and two or three heading sizes -- and scanning six pairs of
+/// integers beats hashing one.
+///
+/// ASCII only, deliberately. Everything above 127 falls through to the font,
+/// which keeps the table small enough to stay in cache and costs nothing on the
+/// text this program actually lays out. It is also why the ASCII path can skip
+/// the emoji and joiner checks entirely: every one of those ranges is above
+/// 0x2000.
+struct Row {
+    face: Face,
+    quarters: u32,
+    /// `NaN` means "not asked yet". A real advance is never NaN, so the sentinel
+    /// needs no second array of flags.
+    ascii: [f32; 128],
+}
+
+/// How many (face, size) pairs to keep. A document uses about six; the cap is
+/// there so a pathological one cannot grow this without bound.
+const ROWS: usize = 16;
+
 pub struct Text {
     sans: FontRef<'static>,
     sans_bold: FontRef<'static>,
@@ -144,6 +175,8 @@ pub struct Text {
     /// A `OnceCell` because measuring takes `&self` -- a paragraph is measured
     /// before anything is drawn -- and the first measurement is where the need
     /// for the font is discovered.
+    /// Cached advances; see [`Row`].
+    rows: RefCell<Vec<Row>>,
     emoji: OnceCell<Option<Emoji>>,
     /// Which characters that font actually has a picture for.
     ///
@@ -162,6 +195,7 @@ impl Text {
             sans_italic: FontRef::try_from_slice(SANS_ITALIC).expect("embedded italic is valid"),
             mono: FontRef::try_from_slice(MONO).expect("embedded mono is valid"),
             cache: HashMap::new(),
+            rows: RefCell::new(Vec::new()),
             emoji: OnceCell::new(),
             has_emoji: RefCell::new(HashMap::new()),
         }
@@ -218,7 +252,13 @@ impl Text {
     /// drawn in a fence lines up here the way it does where it was written.
     fn emoji_advance(&self, face: Face, px: f32) -> f32 {
         match face {
-            Face::Mono => self.advance(Face::Mono, 'M', px) * 2.0,
+            // Straight to the font, NOT back through `advance`: this is reached
+            // from inside `width`, which is holding the row cache. Going round
+            // again would borrow it twice and panic.
+            Face::Mono => {
+                let f = self.font(Face::Mono).as_scaled(PxScale::from(px));
+                f.h_advance(f.scaled_glyph('M').id) * 2.0
+            }
             _ => px * crate::emoji::EM_ADVANCE,
         }
     }
@@ -227,6 +267,63 @@ impl Text {
     /// and it does not rasterise -- measuring a paragraph should not fill the
     /// cache with glyphs that turn out to be off screen.
     pub fn advance(&self, face: Face, ch: char, px: f32) -> f32 {
+        if (ch as u32) < 128 {
+            let quarters = (px * 4.0).round() as u32;
+            let mut rows = self.rows.borrow_mut();
+            let i = self.row(&mut rows, face, quarters);
+            return self.ascii_advance(&mut rows[i], face, ch, px);
+        }
+        self.measure(face, ch, px)
+    }
+
+    /// Width of a string at one size. What line breaking is decided against.
+    ///
+    /// Written as a loop rather than `chars().map(advance).sum()` so the row is
+    /// found ONCE for the whole word instead of once per character. Words are
+    /// short, so that lookup was a real share of the cost.
+    pub fn width(&self, face: Face, s: &str, px: f32) -> f32 {
+        let quarters = (px * 4.0).round() as u32;
+        let mut rows = self.rows.borrow_mut();
+        let i = self.row(&mut rows, face, quarters);
+        let mut total = 0.0;
+        for ch in s.chars() {
+            total += if (ch as u32) < 128 {
+                self.ascii_advance(&mut rows[i], face, ch, px)
+            } else {
+                self.measure(face, ch, px)
+            };
+        }
+        total
+    }
+
+    /// The cached advance for an ASCII character, filling the slot on a miss.
+    ///
+    /// No emoji or joiner check: every one of those ranges is above 0x2000, so
+    /// for ASCII the answer is always the font's.
+    #[inline]
+    fn ascii_advance(&self, row: &mut Row, face: Face, ch: char, px: f32) -> f32 {
+        let slot = &mut row.ascii[ch as usize];
+        if slot.is_nan() {
+            let f = self.font(face).as_scaled(PxScale::from(px));
+            *slot = f.h_advance(f.scaled_glyph(ch).id);
+        }
+        *slot
+    }
+
+    /// Find or create the row for one (face, size), newest first.
+    fn row(&self, rows: &mut Vec<Row>, face: Face, quarters: u32) -> usize {
+        if let Some(i) = rows.iter().position(|r| r.face == face && r.quarters == quarters) {
+            return i;
+        }
+        if rows.len() == ROWS {
+            rows.pop();
+        }
+        rows.insert(0, Row { face, quarters, ascii: [f32::NAN; 128] });
+        0
+    }
+
+    /// Ask the font. Everything the cache does not cover comes through here.
+    fn measure(&self, face: Face, ch: char, px: f32) -> f32 {
         // Asked BEFORE the emoji check, because skin tones and the joiners live
         // inside the emoji blocks. Without shaping they cannot do their job, so
         // they take no room -- see `emoji::is_joiner`.
@@ -238,11 +335,6 @@ impl Text {
         }
         let f = self.font(face).as_scaled(PxScale::from(px));
         f.h_advance(f.scaled_glyph(ch).id)
-    }
-
-    /// Width of a string at one size. What line breaking is decided against.
-    pub fn width(&self, face: Face, s: &str, px: f32) -> f32 {
-        s.chars().map(|c| self.advance(face, c, px)).sum()
     }
 
     /// A rasterised glyph, from the cache or freshly drawn into it.

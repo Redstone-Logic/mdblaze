@@ -514,7 +514,7 @@ pub fn lay_out(
                         for word in words(chunk) {
                             let at = source.start + used;
                             used += word.len();
-                            let w = text.width(face, word, px);
+                            let mut w = text.width(face, word, px);
                             if !line_start && cursor + w > text_x + text_avail {
                                 y += lh;
                                 cursor = text_x;
@@ -525,7 +525,14 @@ pub fn lay_out(
                                 continue;
                             }
                             let at = at + (word.len() - trimmed.len());
-                            let w = text.width(face, trimmed, px);
+                            // Measured again ONLY if trimming took something
+                            // off. Every word was being measured twice --
+                            // once to test the wrap and once to place it -- and
+                            // measuring is most of what laying out costs. Off a
+                            // line start the two are the same string.
+                            if trimmed.len() != word.len() {
+                                w = text.width(face, trimmed, px);
+                            }
                             out.runs.push(Run {
                                 x: cursor,
                                 baseline: y + asc,
