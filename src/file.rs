@@ -19,6 +19,38 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// A file's permission bits, on systems that have them.
+///
+/// Split out and gated rather than written inline, because `PermissionsExt` does
+/// not exist on Windows and its absence was the ONLY thing stopping this crate
+/// compiling there -- five errors, all in this file, in a program that is
+/// otherwise portable.
+///
+/// Windows has no mode to carry across. Its access control lives in an ACL,
+/// which a rename does not copy from the file being replaced: the new file keeps
+/// the ACL it inherited from the directory it was created in, which is the same
+/// place the original got its own. So doing nothing here is not a gap, it is the
+/// correct behaviour written down.
+#[cfg(unix)]
+fn mode_of(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).ok().map(|m| m.permissions().mode())
+}
+
+#[cfg(not(unix))]
+fn mode_of(_path: &Path) -> Option<u32> {
+    None
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) {}
+
 /// Where the temp sibling goes: beside the target, so the rename stays inside
 /// one filesystem. A temp file in `/tmp` would be a copy across devices, which
 /// rename cannot do and which stops being atomic.
@@ -36,10 +68,7 @@ fn temp_beside(path: &Path) -> PathBuf {
 /// what a shared file is readable by.
 pub fn save_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     let tmp = temp_beside(path);
-    let existing_mode = std::fs::metadata(path).ok().map(|m| {
-        use std::os::unix::fs::PermissionsExt;
-        m.permissions().mode()
-    });
+    let existing_mode = mode_of(path);
 
     // Scoped so the handle is closed before the rename: on some platforms
     // renaming over an open file is refused, and a flush is not a close.
@@ -53,8 +82,7 @@ pub fn save_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     }
 
     if let Some(mode) = existing_mode {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
+        set_mode(&tmp, mode);
     }
 
     match std::fs::rename(&tmp, path) {
@@ -123,6 +151,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn existing_permissions_survive_a_save() {
         use std::os::unix::fs::PermissionsExt;
         let d = tmpdir();

@@ -174,8 +174,26 @@ at the exact moment someone asked for their work to be kept.
   66 characters of prose, 79 columns of code (PEP 8's limit, and what most code
   is written to). Everything shares one left edge regardless -- blocks of
   different widths are fine, a left edge that moves between them is not.
-- **The handler is Linux only.** `.desktop` files are a freedesktop convention;
-  macOS declares document types in an app bundle and Windows in the registry.
+- **It compiles for Linux, macOS and Windows; the HANDLER is Linux only.**
+
+  ```sh
+  cargo check --target aarch64-apple-darwin --all-targets
+  cargo check --target x86_64-pc-windows-msvc --all-targets
+  ```
+
+  Both are clean, and neither needs a Mac or a PC to run. What is not portable is
+  registering as the opener for `.md`: `.desktop` files are a freedesktop
+  convention, macOS declares document types in an app bundle's `Info.plist`, and
+  Windows keeps them in the registry. `--install-handler` refuses off Linux
+  rather than pretending.
+
+  Nothing here has been RUN on macOS or Windows, which is a different claim from
+  compiling and is not made.
+- **No colour emoji on Windows.** macOS's Apple Color Emoji stores pictures in
+  `sbix` and Linux's Noto Color Emoji in `CBDT`, both of which are PNGs this
+  program already decodes. Windows' Segoe UI Emoji is `COLR`/`CPAL` -- layered
+  vector glyphs with a palette -- which needs a different renderer. Emoji fall
+  back to the text face there, which has no glyphs for them.
 
 - **Tables do not scroll sideways.** A table with many columns is scaled down
   until a minimum width, then overflows the measure rather than shrinking a
