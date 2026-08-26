@@ -1,0 +1,124 @@
+name: Release
+
+# Tag-driven. `git tag v0.1.0 && git push --tags` is the whole ritual.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Fails the whole thing before any of the slow builds start, because a release
+  # whose binary reports a different version to its tag is worse than no release.
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          crate=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "tag=$tag crate=$crate"
+          [ "$tag" = "$crate" ] || { echo "::error::tag v$tag != Cargo.toml $crate"; exit 1; }
+
+  build:
+    needs: check-version
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04 rather than latest, deliberately: the binary links against the
+          # builder's glibc, and building on the newest image produces something
+          # that refuses to start on any older distribution.
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxkbcommon-x11-dev
+
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # A tarball on Unix and a zip on Windows, each carrying the licences --
+      # the Noto faces inside the binary are OFL and that text has to travel
+      # with it. See NOTICE.
+      - name: package
+        shell: bash
+        run: |
+          set -eu
+          out="mdblaze-${{ matrix.name }}"
+          mkdir -p "dist/$out"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/mdblaze.exe" "dist/$out/"
+          else
+            cp "target/${{ matrix.target }}/release/mdblaze" "dist/$out/"
+          fi
+          cp README.md NOTICE LICENSE-MIT LICENSE-APACHE "dist/$out/"
+          cp assets/fonts/LICENSE-Noto.txt "dist/$out/"
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "$out.zip" "$out" > /dev/null
+          else
+            tar czf "$out.tar.gz" "$out"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # Checksums, so somebody who downloads a binary from the internet can tell
+      # whether it is the one that was built here.
+      - name: checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz *.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF#refs/tags/}" \
+            --title "${GITHUB_REF#refs/tags/}" \
+            --generate-notes \
+            dist/*.tar.gz dist/*.zip dist/SHA256SUMS

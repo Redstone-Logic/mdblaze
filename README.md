@@ -149,6 +149,20 @@ reliable way to lose the entire budget.
 program already decodes; Segoe UI Emoji is layered vector glyphs with a palette,
 which needs a different renderer.
 
+## Releases
+
+Prebuilt binaries for Linux, macOS (Apple silicon and Intel) and Windows are on
+the [releases page](https://github.com/Redstone-Logic/mdblaze/releases), with a
+`SHA256SUMS` alongside them.
+
+The Linux build is made on an older distribution on purpose: a binary links
+against the glibc it was built with, and one built on the newest image refuses to
+start on anything older.
+
+Each archive carries the licences with it, because the Noto faces compiled into
+the binary are under the SIL Open Font License and that text has to travel with
+any copy. See [NOTICE](NOTICE).
+
 ## Building
 
 ```sh
