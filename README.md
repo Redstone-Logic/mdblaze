@@ -208,9 +208,10 @@ git push origin v0.2.1
 ```
 
 The tag builds the four binaries, cuts the GitHub release and publishes the
-crate, in that order, with the irreversible step last. A `check-version` job
-refuses a tag that disagrees with `Cargo.toml` before any of the slow builds
-start. **No crates.io API token exists anywhere in
+crate, in that order, with the irreversible step last. A gate job runs first and
+refuses a tag that disagrees with `Cargo.toml`, then proves the packaged crate
+compiles — so a bad `exclude` list is caught before anything is published rather
+than after. **No crates.io API token exists anywhere in
 this repository or its secrets**: the publishing job asks GitHub for an OIDC
 token, crates.io trades it for one of its own that lasts minutes, and it is
 revoked when the job ends.

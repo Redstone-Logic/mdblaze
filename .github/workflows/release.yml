@@ -10,16 +10,25 @@ on:
 permissions:
   contents: write
 
+# One release at a time per tag. Two runs on the same ref would race each other
+# to create the GitHub release and to publish the crate.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Fails the whole thing before any of the slow builds start, because a release
-  # whose binary reports a different version to its tag is worse than no release.
+  # Everything that can say "do not release this" says it HERE, before a single
+  # binary is built and long before anything irreversible happens.
   check-version:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # First, and cheap: a release whose binary reports a different version to
+      # its tag is worse than no release.
       - name: tag matches Cargo.toml
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -27,6 +36,28 @@ jobs:
           crate=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           echo "tag=$tag crate=$crate"
           [ "$tag" = "$crate" ] || { echo "::error::tag v$tag != Cargo.toml $crate"; exit 1; }
+
+      - uses: dtolnay/rust-toolchain@stable
+      - name: system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxkbcommon-x11-dev
+
+      # Prove the PACKAGED crate compiles, which is not the same as proving the
+      # working tree does: `exclude` in Cargo.toml keeps files out of the
+      # tarball, and this repository excludes `assets/icon-master*.png` while
+      # compiling other files from `assets/` straight into the binary. Get that
+      # list wrong and the crate is broken for everyone who installs it.
+      #
+      # It happens here, in the gate, rather than inside `cargo publish` at the
+      # end. There it would be the first check of the tarball -- discovered only
+      # after four binaries were built and the GitHub release was public. Here it
+      # costs a minute and nothing has been published yet.
+      #
+      # No token exists in this job. That is the point: verifying means BUILDING,
+      # and building runs the build scripts and proc macros of every dependency.
+      - name: the packaged crate compiles
+        run: cargo package --locked
 
   build:
     needs: check-version
@@ -161,21 +192,15 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
-      # The one permission that makes the whole arrangement work, and it is not
-      # on by default. Without it there is no OIDC token to trade.
+      # BOTH of these, and the second one is not optional padding. Naming any
+      # permission at job level REPLACES the workflow's block rather than adding
+      # to it, and everything left out becomes `none` -- so writing `id-token`
+      # alone silently takes the checkout's repository access away with it.
       id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-
-      # `cargo publish` builds the packaged crate before uploading it, to prove
-      # the tarball actually compiles. That build needs the same X11 and Wayland
-      # headers the test job installs, and without them it fails in a way that
-      # reads as a Rust problem rather than a missing package.
-      - name: system libraries
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxkbcommon-x11-dev
 
       # A re-run must not fail for the wrong reason. If a runner flakes and the
       # workflow is run again on the same tag, the version is already up and
@@ -223,10 +248,20 @@ jobs:
         id: auth
         if: steps.published.outputs.skip == 'false'
 
-      # `--locked` so the crate is built from the same dependency versions the
-      # tested binaries were, rather than whatever has been released since.
+      # `--no-verify` because the gate job ALREADY built this exact tarball, from
+      # this exact commit, and proved it compiles. Verified byte-for-byte: with
+      # and without the rebuild, the same commit packages to the same SHA256, so
+      # what was proven there is what is uploaded here. Doing it again here would add
+      # nothing except the one thing worth avoiding: `cargo` verifies by
+      # BUILDING, and a build runs the build scripts and proc macros of every
+      # dependency -- 63 of them in this tree -- with the registry token sitting
+      # in their environment. Skipping the rebuild means no third-party code runs
+      # anywhere near the credential.
+      #
+      # `--locked` so the tarball is cut from the same dependency versions the
+      # binaries were tested against, not whatever has been released since.
       - name: cargo publish
         if: steps.published.outputs.skip == 'false'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: cargo publish --locked
+        run: cargo publish --locked --no-verify
