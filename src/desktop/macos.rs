@@ -43,12 +43,26 @@
 use super::{DESCRIPTION, EXTENSIONS, NAME};
 use std::path::{Path, PathBuf};
 
+/// The icon, in Apple's container format. Built from `assets/icon.svg`; see
+/// `assets/README.md` for how, and why it is checked in rather than generated.
+///
+/// Read only by the installer, which runs on macOS -- but the tests below check
+/// the bytes are a real container on every platform, because a truncated icon
+/// produces an application with no icon and no error saying why.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const ICNS: &[u8] = include_bytes!("../../assets/icon.icns");
+
 /// The Uniform Type Identifier for markdown.
 ///
 /// Not an invention: this is the identifier the wider ecosystem settled on, and
 /// declaring a different one would mean this program and every other markdown
 /// application disagree about what a `.md` file is.
 pub const UTI: &str = "net.daringfireball.markdown";
+
+/// The icon inside the bundle, named without its extension the way
+/// `CFBundleIconFile` expects -- macOS appends `.icns` itself, and writing it
+/// out here is a common way to get an application with no icon and no error.
+pub const ICON_FILE: &str = "icon";
 
 /// `Info.plist` for a bundle whose executable is called `exec_name`.
 ///
@@ -77,6 +91,8 @@ pub fn plist(exec_name: &str) -> String {
          \x20   <string>{NAME}</string>\n\
          \x20   <key>CFBundleExecutable</key>\n\
          \x20   <string>{exec_name}</string>\n\
+         \x20   <key>CFBundleIconFile</key>\n\
+         \x20   <string>{ICON_FILE}</string>\n\
          \x20   <key>CFBundlePackageType</key>\n\
          \x20   <string>APPL</string>\n\
          \x20   <key>CFBundleInfoDictionaryVersion</key>\n\
@@ -159,6 +175,11 @@ pub(super) fn install() -> std::io::Result<Vec<String>> {
     std::fs::create_dir_all(&macos_dir)?;
     std::fs::write(app.join("Contents/Info.plist"), plist(NAME))?;
 
+    // The same icon the other two platforms use, in the container macOS reads.
+    let resources = app.join("Contents/Resources");
+    std::fs::create_dir_all(&resources)?;
+    std::fs::write(resources.join(format!("{ICON_FILE}.icns")), ICNS)?;
+
     let launcher = macos_dir.join(NAME);
     std::fs::write(&launcher, trampoline(&exe))?;
     std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))?;
@@ -211,6 +232,25 @@ mod tests {
         // application about what a .md file IS would be worse than not claiming
         // it at all.
         assert!(p.contains("net.daringfireball.markdown"));
+    }
+
+    #[test]
+    fn the_plist_points_at_an_icon_and_names_it_the_way_macos_expects() {
+        // `CFBundleIconFile` takes the name WITHOUT the extension; macOS appends
+        // `.icns` itself. Writing "icon.icns" there is a well-worn way to end up
+        // with an application that has no icon and no error explaining why.
+        let p = plist("mdblaze");
+        assert!(p.contains("<key>CFBundleIconFile</key>"), "{p}");
+        assert!(p.contains(&format!("<string>{ICON_FILE}</string>")));
+        assert!(!p.contains(".icns"), "the extension must not be in the plist value");
+    }
+
+    #[test]
+    fn the_icon_really_is_an_icns() {
+        // A truncated or mis-built container is an application with no icon and
+        // nothing said about it. Four bytes of magic is enough to catch that.
+        assert_eq!(&ICNS[..4], b"icns");
+        assert!(ICNS.len() > 4000, "suspiciously small: {}", ICNS.len());
     }
 
     #[test]

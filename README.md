@@ -1,251 +1,159 @@
+<div align="center">
+
+<img src="assets/icon.png" width="96" alt="">
+
 # mdblaze
 
-A markdown editor that renders, and opens instantly.
+**Rendered markdown, on screen in 25 milliseconds. Close it and nothing is left running.**
 
-Nothing occupies the space between the two. A browser or a text editor shows you
-the source. Obsidian shows you the document, but pays an Electron start and a
-vault index before it can show you anything at all. Opening one file to read it
-should cost neither.
+[![CI](https://github.com/Redstone-Logic/mdblaze/actions/workflows/ci.yml/badge.svg)](https://github.com/Redstone-Logic/mdblaze/actions/workflows/ci.yml)
+[![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue)](#licence)
 
-## Measured
+</div>
 
-Minimum of twelve runs on the machine it was written on, a 900x760 window.
+---
 
-| | 10 KB document | 142 KB document |
-|---|---|---|
-| parse | 0.07 ms | 0.32 ms |
-| lay out | 0.17 ms | 1.63 ms |
-| draw a frame | 0.40 ms | 0.45 ms |
-| **our work, start to first frame** | **0.61 ms** | **3.81 ms** |
-| first frame on screen | 24.6 ms | 31.3 ms |
+You double-click a `.md` file.
 
-Drawing is flat because only what is on screen is drawn; a long document scrolls
-at the cost of a short one.
+- Your **browser** shows you `# raw text` with hashes and asterisks.
+- **VS Code**, **Notepad++**, **vim**: raw text, or a preview pane you have to go
+  and ask for, in a window that was already open because you left it open.
+- **Obsidian** renders it properly — after an Electron runtime starts and your
+  vault is indexed. For one file you wanted to read.
 
-### Where the wait actually is
+Nothing lives in the gap between "shows me the document" and "is already open".
+That gap is the whole of this program.
 
-Run with `--timing` and it reports each phase. On the 10 KB document:
+<div align="center">
+<img src="docs/rendered.png" width="720" alt="mdblaze showing a rendered markdown document with a table, highlighted Rust, and colour emoji">
+</div>
 
+## Editing is the same window
+
+No modes. No preview pane. No split view. The document is always rendered — and
+the block your caret is in shows you its markdown, so you can change it. Move
+away and it renders again.
+
+<div align="center">
+<img src="docs/editing.png" width="720" alt="the paragraph under the caret showing its raw markdown while the heading above it stays rendered">
+</div>
+
+That is the entire editing model. There is nothing else to learn.
+
+## Install
+
+```sh
+cargo install mdblaze
+mdblaze --install-handler     # now double-clicking a .md file opens it
 ```
-read+parse+layout   0.61 ms     <- everything this program does
-event loop         16.29 ms     <- winit
-window              0.67 ms
-surface             0.19 ms
-```
 
-So **96% of what a person waits for is the toolkit**, and almost all of that is
-one call: `EventLoop::new()`.
-
-Thirteen of those milliseconds are `xkb_compose_table_new_from_locale`, which
-parses `/usr/share/X11/locale/en_US.UTF-8/Compose` -- 5,172 lines -- on the way
-up. Proved by measuring against `XCOMPOSEFILE=/dev/null`, which takes the event
-loop from 19.4 ms to 6.4 ms.
-
-That table is what makes dead keys work: `Compose` `'` `e` giving `é`. Typing an
-accented character into a document is an ordinary thing to want, so this is
-**not** disabled to win the 13 ms. winit builds the table eagerly, with no knob
-to defer it, so the fix is upstream or in a hand-written backend -- raw X11 puts
-a window up in 0.2 ms, at the price of a backend per platform and a compose
-implementation of one's own.
-
-It is written down here because a claim of "30 ms" that is really "1 ms of us and
-29 ms of a dependency" is a claim that stops being true the moment somebody
-believes it.
-
-## The shape, and why
-
-Speed decides the architecture rather than being tuned for afterwards.
-
-- **No document tree.** Parsing produces a flat list of blocks with a depth
-  number, so laying out is one ordered walk.
-- **No HTML.** The console renders markdown to HTML because a browser consumes it
-  there. Here the consumer is a rasteriser.
-- **No font system.** The text faces are compiled in. Asking the OS what fonts
-  exist is the most reliable way to lose the whole budget. The one exception is
-  colour emoji: 10.8MB is too much to put in every copy of the binary for a
-  feature most documents do not use, so the file is opened from a list of four
-  absolute paths -- a list, not a scan -- and only once a document turns out to
-  contain an emoji. It is mapped rather than read, so an emoji costs the two
-  pages its own picture is on.
-- **A lazy font reader.** The first version used an eager one and paid 36ms *per
-  face* -- 100ms, 95% of startup, to build outlines for glyphs no document uses.
-  Avoiding fontconfig and then parsing the fonts anyway is not a saving.
-- **No GPU.** A graphics context costs more than everything else here put
-  together, to draw static text.
-- **No vault, no index, no workspace.** One file, opened.
+`--install-handler` works on Linux, macOS and Windows. It records whatever used
+to open markdown and `--uninstall-handler` gives it back, because a program that
+seizes a file association and cannot return it is one you should not have
+installed.
 
 ## Use
 
 ```sh
-mdblaze --install-handler     # open .md by double-click
-mdblaze --uninstall-handler   # and give the association back
-
-mdblaze README.md             # read it
-mdblaze --edit README.md      # open straight into editing
-mdblaze --timing file.md      # and say where the time went
-mdblaze --shot out.ppm f.md   # render one frame with no window at all
+mdblaze notes.md          # read it
+mdblaze --timing notes.md # and say where the milliseconds went
 ```
 
-`--install-handler` also sweeps out any entry left by a name this program used
-to ship under, and carries that install's record of what it displaced across --
-so uninstalling gives markdown back to whatever had it *before* any version of
-this, rather than to a `.desktop` file that no longer exists.
+| | |
+|---|---|
+| **click** | put the caret there — that block reveals its markdown |
+| **Ctrl+S** | save, atomically |
+| **Ctrl+Z** / **Ctrl+Y** | undo, redo |
+| **Esc** | close — twice, quickly, to discard unsaved changes |
 
-The document is always rendered. The block your caret is in shows its markdown
-so you can change it, and the moment the caret leaves, that block renders again.
-No mode to switch, no second pane: what you edit is what you are looking at.
+Arrows, Home, End, PageUp and PageDown do what they do everywhere.
 
-`--install-handler` writes a `.desktop` entry and makes it the default for
-`text/markdown` and `text/x-markdown`. It records whatever it displaced and
-`--uninstall-handler` puts that back: a tool that seizes a file association and
-cannot give it back is one people are right to be wary of.
+## It renders the markdown you actually write
 
-Click to put the caret where you clicked -- including in a block that is still
-rendered, which reveals it. Arrow keys move the caret, the wheel and
-PageUp/PageDown scroll without moving it, Home/End go to the ends of the line. `Ctrl+S` saves, `Ctrl+Z` undoes,
-`Ctrl+Shift+Z` or `Ctrl+Y` redoes, Escape closes -- and asks once first if there
-are unsaved changes. Tab inserts two spaces, because markdown's nesting is
-defined in spaces and a literal tab renders differently in every tool that reads
-the file next.
+Headings, emphasis, lists, task lists, block quotes, tables, links.
 
-### Why live rendering is affordable here
+**Fenced code, highlighted** without a syntax library — Rust, JS/TS, Python,
+shell, Go, the C family, SQL, JSON, YAML and TOML. An unknown fence is shown
+plain rather than guessed at.
 
-Every keystroke re-parses and re-lays out the **whole document**: about 4ms for a
-36KB file, a quarter of a frame at 60Hz. Incremental re-layout is where editors
-of this kind get complicated and subtly wrong, and at this speed it buys nothing.
+**Mermaid diagrams**, drawn as box-drawing text. The SVG renderers need a
+rasteriser, and the obvious one drags in a font database — the exact thing that
+would cost more than this program's entire startup.
 
-The map that makes it possible is that every block, span and run records the
-source bytes it came from. A cursor is a position in the source and rendering
-happens in blocks, so without that map the two coordinate systems never meet:
-the caret can only live in a separate source pane, and a click can only answer
-in screen terms.
+**Colour emoji**, from the font already on your machine. None is shipped: a
+document with no emoji in it never even opens one.
 
-Both directions are needed. Laying out turns a byte offset into a position on
-screen; clicking turns a position on screen back into a byte offset. The second
-is why runs carry provenance rather than just text -- the rendered text is not
-the source, since `**bold**` renders as `bold`, so the mapping cannot be
-arithmetic on what is displayed.
+**Pictures**, PNG and JPEG, from disk. Never from the network — a markdown file
+arrives from anywhere, and one that says `![](https://…)` is asking this program
+to tell a stranger which files you open and when. There is no setting for it.
 
-Closing with unsaved changes is refused once, on every route out -- Escape, the
-title bar's close button, the window manager. A guard that only covers the way
-you thought of is not a guard. The whole status bar turns red while the second
-press would discard, and the bypass expires after a second and a half: a swift
-second press is someone confirming, a slow one is someone who has moved on.
+## Why it is fast
 
-Saving is a temp sibling plus a rename. `fs::write` truncates first, so a crash
-or a full disk between the truncate and the write leaves the truncated file --
-at the exact moment someone asked for their work to be kept.
+Because it does not do the things that are slow. There is no document tree, no
+HTML, no font system, no GPU context, no vault, no index and no workspace.
 
-## Limits, stated
+Minimum of twelve runs, 10 KB document:
 
-- **Noto Sans, whatever you have installed.** No coverage for scripts the
-  embedded faces lack -- CJK, Arabic, Devanagari render as missing glyphs. The
-  fix is to embed more coverage, not to start asking the system.
-- **Absolute Windows paths took a fix that only a Windows runner could find.**
-  `C:\...` is a legal one-letter URL scheme by RFC 3986 and an absolute path on
-  one of the three platforms this runs on, so the ambiguity is resolved in
-  favour of the file: a scheme now needs at least two characters before the
-  colon. Before that, every absolute path on Windows was refused as remote.
-- **Pictures are local, and PNG or JPEG.** A markdown file arrives from
-  anywhere, and one that says `![](https://...)` is asking this program to tell
-  a stranger which files you open and when. Remote images are not fetched and
-  there is no setting to fetch them; the alt text and the reason are shown
-  instead. Everything else -- GIF, WebP, AVIF, SVG -- is a decoder's worth of
-  code and attack surface for a format that does not turn up in a document about
-  software.
-- **Emoji sequences render as their base character.** A skin tone, a variation
-  selector or a zero-width joiner needs the font's ligature substitutions
-  applied, which means a shaping engine. A family comes out as its first member
-  and a waving hand in the font's default yellow. In prose an emoji takes a
-  fixed multiple of the type size; in a code fence, exactly two columns, which
-  is what a terminal gives it.
-- **A picture in a table cell shows its alt text.** A picture in a cell would
-  need that row to be as tall as the picture, and the table is measured as a
-  grid of type -- which is what makes the columns line up. Badge tables read as
-  a list of what the badges say.
-- **Mermaid diagrams render as box drawing**, not as pictures. The SVG renderers
-  need a rasteriser, and the obvious one pulls 84 crates including `fontdb` --
-  the font scanning this program exists without. A diagram that will not parse
-  falls back to its source rather than vanishing.
-- **Highlighting knows a short list of languages** -- Rust, JS/TS, Python, shell,
-  Go, C-family, SQL, JSON, YAML/TOML. An unknown fence is shown plain rather than
-  guessed at. It is a lexer, not a parser: it cannot tell a type from a variable,
-  and it never alters the text, only its colour.
-- **No settings, by choice.** The size, the measure and the leading are decided
-  rather than exposed: a document reader that asks people to configure their
-  typography has failed at the one job it has. 19px, about 66 characters a line,
-  1.55 leading -- the middle of the band typographic practice settled on.
-- **Prose and code get different measures**, because they are read differently:
-  66 characters of prose, 79 columns of code (PEP 8's limit, and what most code
-  is written to). Everything shares one left edge regardless -- blocks of
-  different widths are fine, a left edge that moves between them is not.
-- **Three platforms, only one of them run.**
+| | |
+|---|---|
+| parse | 0.07 ms |
+| lay out | 0.17 ms |
+| draw a frame | 0.40 ms |
+| **everything this program does** | **0.61 ms** |
+| first frame on screen | **24.6 ms** |
 
-  ```sh
-  cargo check --target aarch64-apple-darwin  --all-targets   # clean
-  cargo check --target x86_64-pc-windows-msvc --all-targets  # clean
-  ```
+The honest part: **96% of that wait is the windowing toolkit, not us.** `--timing`
+says so out loud. Thirteen milliseconds of it is X11 parsing its 5,172-line
+Compose table so that dead keys work — measured against `XCOMPOSEFILE=/dev/null`,
+which takes the event loop from 19.4 ms to 6.4 ms. It is not disabled, because
+typing `é` into a document is an ordinary thing to want.
 
-  Neither needs a Mac or a PC. `--install-handler` works on all three, by three
-  completely different mechanisms that share nothing: a `.desktop` entry and
-  `mimeapps.list` on Linux, an application bundle registered with LaunchServices
-  on macOS, a ProgId and extension association under `HKEY_CURRENT_USER` on
-  Windows.
+A claim of "25 ms" that is really "1 ms of us and 24 of a dependency" stops being
+true the moment somebody believes it, so it is written down.
 
-  Only the Linux path has been RUN. The macOS and Windows paths compile and
-  their *decisions* are tested here -- what the plist says, which registry values
-  get written, that `%1` is quoted so a path with a space still opens -- because
-  those are pure functions. What is untested is the thin layer that writes them
-  down. That is not the same as working, and this does not claim it is.
-- **Neither macOS nor Windows lets a program make itself the default.** macOS
-  needs `LSSetDefaultRoleHandlerForContentType`, an Objective-C dependency that
-  recent versions may refuse anyway; Windows hash-protects the value that decides
-  it, deliberately, because of decades of browsers seizing file types. On both,
-  installing puts this program in the "Open with" list and the report tells you
-  the one gesture that finishes the job. On Linux it can and does set the
-  default -- and records what it displaced so uninstalling gives it back.
-- **No colour emoji on Windows.** macOS's Apple Color Emoji stores pictures in
-  `sbix` and Linux's Noto Color Emoji in `CBDT`, both of which are PNGs this
-  program already decodes. Windows' Segoe UI Emoji is `COLR`/`CPAL` -- layered
-  vector glyphs with a palette -- which needs a different renderer. Emoji fall
-  back to the text face there, which has no glyphs for them.
+## What it does not do, on purpose
 
-- **Tables do not scroll sideways.** A table with many columns is scaled down
-  until a minimum width, then overflows the measure rather than shrinking a
-  column to nothing -- a column of no width shows nothing, which is worse than
-  crowding.
-- **No selection, no clipboard, no find.** The editing is a caret, characters and
-  undo, and the mouse places the caret but does not drag a selection. Enough to
-  fix a line; not yet enough to restructure a document.
-- **Clicks inside emphasis are approximate.** A span's rendered text and its
-  source are the same length for plain text and differ where markers were
-  stripped, so a click inside `**bold**` can land a character or two out. Exact
-  everywhere else, and exact in the revealed block, which is literal source.
-- **The product now renders markdown twice** -- HTML in the console, this here --
-  and the two can drift. Accepted because this opens arbitrary files rather than
-  organisation content, so they never render the same document.
+**No settings.** The size, the measure and the leading are decided: 19px, about
+66 characters a line, 1.55 leading — the middle of the band typographic practice
+settled on. A document reader that asks you to configure your typography has
+failed at the one job it has.
+
+**No selection, no clipboard, no find.** Enough to fix a line. Not yet enough to
+restructure a document.
+
+**One file.** If you want a vault, you want Obsidian, and it is very good.
+
+**Latin scripts only.** The faces are compiled into the binary, so CJK, Arabic
+and Devanagari come out as missing glyphs. The fix is to embed more coverage, not
+to start asking the operating system what fonts exist — which is the single most
+reliable way to lose the entire budget.
+
+**No colour emoji on Windows.** macOS and Linux store emoji as PNG strikes this
+program already decodes; Segoe UI Emoji is layered vector glyphs with a palette,
+which needs a different renderer.
+
+## Building
+
+```sh
+cargo test                                                  # 250 tests
+cargo check --target aarch64-apple-darwin  --all-targets
+cargo check --target x86_64-pc-windows-msvc --all-targets
+```
+
+CI runs the tests on Linux, macOS and Windows. Only Linux has been run by a
+person; the other two are exercised by CI and by tests over the pure functions
+that decide what gets written where. That is not the same as somebody using it,
+and this does not claim otherwise.
 
 ## Licence
 
-Dual licensed under either of
+Dual licensed under [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your
+option — MIT because it is what most projects expect, Apache-2.0 because its
+explicit patent grant is what some organisations need before they can use
+anything at all.
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
-
-at your option. This is the Rust ecosystem convention: MIT is the permissive
-default most projects expect, and Apache-2.0 adds an explicit patent grant that
-some organisations require before they can use anything.
-
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in this work by you, as defined in the Apache-2.0 licence, shall
-be dual licensed as above, without any additional terms or conditions.
-
-**The four Noto faces in `assets/fonts/` are not covered by either.** They are
+The four Noto faces in `assets/fonts/` are **not** covered by either: they are
 SIL Open Font License 1.1, and because they are compiled into the binary that
-licence travels with any copy of it, source or built. The OFL permits bundling
-fonts inside software and selling that software; it forbids selling the fonts on
-their own, which nothing here does. See [NOTICE](NOTICE) — it also covers the
-colour emoji font, which is *not* shipped at all, only opened read-only from the
-machine it runs on.
+licence travels with any copy of it. See [NOTICE](NOTICE).
 
-Copyright (c) 2026 Redstone Logic.
+Copyright © 2026 Redstone Logic.

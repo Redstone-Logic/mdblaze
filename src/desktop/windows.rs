@@ -33,6 +33,22 @@
 
 use super::{DESCRIPTION, EXTENSIONS, FORMER_NAMES, NAME};
 
+/// The icon, in Windows' container format. Written beside the association
+/// rather than compiled into the executable as a resource: embedding one needs
+/// a build script and a build-time dependency, and `DefaultIcon` is what decides
+/// the icon on the .md FILES, which is the part a person actually looks at.
+///
+/// Checked on every platform for the same reason as the macOS one: a
+/// mis-built container is an icon that silently does not appear.
+#[cfg_attr(not(windows), allow(dead_code))]
+const ICO: &[u8] = include_bytes!("../../assets/icon.ico");
+
+/// Where the icon is written. Beside the program's own data, not next to the
+/// executable, which may be in a directory the user cannot write to.
+pub fn icon_path() -> std::path::PathBuf {
+    super::home().join("AppData\\Local").join(NAME).join("icon.ico")
+}
+
 /// One registry value to write: the key path under `HKCU`, the value name --
 /// empty for the key's default value -- and the data.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,14 +68,14 @@ pub fn prog_id(name: &str) -> String {
 ///
 /// A pure function of the executable's path, which is what makes the decisions
 /// here checkable on a machine that is not a Windows machine.
-pub fn install_values(exe: &str) -> Vec<Value> {
+pub fn install_values(exe: &str, icon: &str) -> Vec<Value> {
     let id = prog_id(NAME);
     let mut out = vec![
         Value { key: format!("Software\\Classes\\{id}"), name: String::new(), data: DESCRIPTION.into() },
         Value {
             key: format!("Software\\Classes\\{id}\\DefaultIcon"),
             name: String::new(),
-            data: format!("\"{exe}\",0"),
+            data: format!("\"{icon}\",0"),
         },
         Value {
             key: format!("Software\\Classes\\{id}\\shell\\open\\command"),
@@ -140,7 +156,14 @@ pub(super) fn install() -> std::io::Result<Vec<String>> {
         }
     }
 
-    for v in install_values(&exe.to_string_lossy()) {
+    let ico = icon_path();
+    if let Some(dir) = ico.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&ico, ICO)?;
+    said.push(format!("wrote {}", ico.display()));
+
+    for v in install_values(&exe.to_string_lossy(), &ico.to_string_lossy()) {
         let (k, _) = hkcu.create_subkey(&v.key)?;
         k.set_value(&v.name, &v.data)?;
     }
@@ -180,7 +203,10 @@ mod tests {
     use super::*;
 
     fn values() -> Vec<Value> {
-        install_values("C:\\Users\\Someone\\.cargo\\bin\\mdblaze.exe")
+        install_values(
+            "C:\\Users\\Someone\\.cargo\\bin\\mdblaze.exe",
+            "C:\\Users\\Someone\\AppData\\Local\\mdblaze\\icon.ico",
+        )
     }
 
     #[test]
@@ -191,6 +217,33 @@ mod tests {
         let cmd = values().into_iter().find(|v| v.key.ends_with("command")).expect("a command");
         assert!(cmd.data.ends_with("\"%1\""), "{}", cmd.data);
         assert!(cmd.data.starts_with('"'), "the exe path is unquoted: {}", cmd.data);
+    }
+
+    #[test]
+    fn the_file_icon_points_at_the_icon_and_not_at_the_executable() {
+        // `DefaultIcon` decides what .md FILES look like in Explorer. Pointing
+        // it at the exe gets whatever icon the exe has -- which, with no
+        // embedded resource, is the generic one.
+        let v = values().into_iter().find(|v| v.key.ends_with("DefaultIcon")).expect("an icon");
+        assert!(v.data.contains("icon.ico"), "{}", v.data);
+        assert!(v.data.ends_with(",0"), "an icon reference needs its index: {}", v.data);
+        assert!(v.data.starts_with('"'), "unquoted path breaks on Program Files: {}", v.data);
+    }
+
+    #[test]
+    fn the_icon_really_is_an_ico() {
+        // Bytes 0..6 are reserved(0), type(1 = icon), and the image count.
+        assert_eq!(&ICO[..4], &[0, 0, 1, 0]);
+        assert!(ICO[4] >= 3, "too few sizes for Explorer to choose from");
+    }
+
+    #[test]
+    fn the_icon_is_written_somewhere_the_user_can_actually_write() {
+        // Next to the executable would be Program Files or a read-only cargo
+        // bin on a managed machine.
+        let p = icon_path().to_string_lossy().to_lowercase();
+        assert!(p.contains("appdata"), "{p}");
+        assert!(p.ends_with("icon.ico"));
     }
 
     #[test]

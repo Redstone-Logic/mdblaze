@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- mdblaze. The markdown mark -- an M and a downward arrow -- on Redstone
+       Logic's accent red. Deliberately only two shapes: an icon is read at 16
+       pixels in a taskbar far more often than at 512 in a gallery, and anything
+       finer than this turns to mud there. -->
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#d1544b"/>
+      <stop offset="1" stop-color="#a02f28"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="13" fill="url(#g)"/>
+  <g fill="none" stroke="#fbf3f2" stroke-width="6"
+     stroke-linecap="round" stroke-linejoin="round">
+    <path d="M13 45 V21 L22.5 33 L32 21 V45"/>
+    <path d="M46 20 V39"/>
+    <path d="M38.5 33 L46 43 L53.5 33"/>
+  </g>
+</svg>

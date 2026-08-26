@@ -63,15 +63,10 @@ pub fn entry(exec: &str) -> String {
 /// A document with a corner turned, in the accent. Scalable, so it is one file
 /// for every size a desktop asks for.
 pub fn icon() -> String {
-    "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\">\n\
-     <rect width=\"64\" height=\"64\" rx=\"10\" fill=\"#121212\"/>\n\
-     <path d=\"M20 14h16l10 10v26a2 2 0 0 1-2 2H20a2 2 0 0 1-2-2V16a2 2 0 0 1 2-2z\" fill=\"#1b1b1b\" stroke=\"#b63c35\" stroke-width=\"2\"/>\n\
-     <path d=\"M36 14v10h10\" fill=\"none\" stroke=\"#b63c35\" stroke-width=\"2\"/>\n\
-     <rect x=\"24\" y=\"32\" width=\"16\" height=\"2.5\" fill=\"#e8e8e8\"/>\n\
-     <rect x=\"24\" y=\"38\" width=\"12\" height=\"2.5\" fill=\"#a8a8a8\"/>\n\
-     <rect x=\"24\" y=\"44\" width=\"14\" height=\"2.5\" fill=\"#a8a8a8\"/>\n\
-     </svg>\n"
-        .to_string()
+    // The one icon, shared with the macOS bundle and the Windows registry -- see
+    // `assets/`. Vector here because a Linux desktop asks for whatever size it
+    // feels like and scalable is the only answer that is right at all of them.
+    include_str!("../../assets/icon.svg").to_string()
 }
 
 /// Read the value of `key` in `section` of an INI-ish desktop config file.

@@ -12,7 +12,7 @@ categories = ["text-editors", "gui", "text-processing"]
 # The Noto faces are compiled in and are SIL OFL 1.1, not MIT/Apache. The SPDX
 # field above describes the CODE, which is the convention; see NOTICE for what
 # the binary actually contains and what travels with it.
-exclude = ["/tests/fixtures", "*.ppm"]
+exclude = ["/docs", "/tests/fixtures", "*.ppm", "assets/make-icons.py"]
 
 [dependencies]
 # The parser only. This crate lays text out itself rather than producing HTML,
