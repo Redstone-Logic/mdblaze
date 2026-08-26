@@ -174,21 +174,31 @@ at the exact moment someone asked for their work to be kept.
   66 characters of prose, 79 columns of code (PEP 8's limit, and what most code
   is written to). Everything shares one left edge regardless -- blocks of
   different widths are fine, a left edge that moves between them is not.
-- **It compiles for Linux, macOS and Windows; the HANDLER is Linux only.**
+- **Three platforms, only one of them run.**
 
   ```sh
-  cargo check --target aarch64-apple-darwin --all-targets
-  cargo check --target x86_64-pc-windows-msvc --all-targets
+  cargo check --target aarch64-apple-darwin  --all-targets   # clean
+  cargo check --target x86_64-pc-windows-msvc --all-targets  # clean
   ```
 
-  Both are clean, and neither needs a Mac or a PC to run. What is not portable is
-  registering as the opener for `.md`: `.desktop` files are a freedesktop
-  convention, macOS declares document types in an app bundle's `Info.plist`, and
-  Windows keeps them in the registry. `--install-handler` refuses off Linux
-  rather than pretending.
+  Neither needs a Mac or a PC. `--install-handler` works on all three, by three
+  completely different mechanisms that share nothing: a `.desktop` entry and
+  `mimeapps.list` on Linux, an application bundle registered with LaunchServices
+  on macOS, a ProgId and extension association under `HKEY_CURRENT_USER` on
+  Windows.
 
-  Nothing here has been RUN on macOS or Windows, which is a different claim from
-  compiling and is not made.
+  Only the Linux path has been RUN. The macOS and Windows paths compile and
+  their *decisions* are tested here -- what the plist says, which registry values
+  get written, that `%1` is quoted so a path with a space still opens -- because
+  those are pure functions. What is untested is the thin layer that writes them
+  down. That is not the same as working, and this does not claim it is.
+- **Neither macOS nor Windows lets a program make itself the default.** macOS
+  needs `LSSetDefaultRoleHandlerForContentType`, an Objective-C dependency that
+  recent versions may refuse anyway; Windows hash-protects the value that decides
+  it, deliberately, because of decades of browsers seizing file types. On both,
+  installing puts this program in the "Open with" list and the report tells you
+  the one gesture that finishes the job. On Linux it can and does set the
+  default -- and records what it displaced so uninstalling gives it back.
 - **No colour emoji on Windows.** macOS's Apple Color Emoji stores pictures in
   `sbix` and Linux's Noto Color Emoji in `CBDT`, both of which are PNGs this
   program already decodes. Windows' Segoe UI Emoji is `COLR`/`CPAL` -- layered

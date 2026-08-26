@@ -1,24 +1,15 @@
-//! Registering as the handler for markdown files, and unregistering again.
+//! The freedesktop half: a `.desktop` entry and `mimeapps.list`.
 //!
-//! Double-clicking a `.md` file is the whole point of a fast editor: the speed
-//! only matters if opening a file is one gesture. On Linux that means a
-//! `.desktop` entry declaring the MIME types it handles, plus an entry in
-//! `mimeapps.list` saying it is the default.
+//! On Linux, being the opener for a file type is two facts in two files. A
+//! `.desktop` entry in `~/.local/share/applications` declares that this program
+//! exists and which MIME types it can handle; a line in `~/.config/mimeapps.list`
+//! says it is the one to use. Neither is enough alone -- an entry with no
+//! default is an application nobody picks, and a default naming an entry that is
+//! not there opens nothing.
 //!
-//! # Why uninstall records what it replaced
-//!
-//! Installing this takes over a file type the person already had an opinion
-//! about -- on the machine this was written on, GNOME Text Editor. A tool that
-//! seizes a file association and cannot give it back is a tool people are right
-//! to be wary of, so the previous default is written down before it is replaced
-//! and put back on uninstall.
-//!
-//! # Linux only, and honest about it
-//!
-//! `.desktop` files are a freedesktop convention. macOS declares document types
-//! in an app bundle's `Info.plist` and Windows writes registry keys; neither is
-//! this, and pretending otherwise by silently doing nothing would be worse than
-//! saying so.
+//! Everything here is written in terms of strings, and the string handling is
+//! what the tests exercise. See [`super`] for why that matters more on the other
+//! two platforms.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -33,17 +24,7 @@ pub const MIMES: &[&str] = &["text/markdown", "text/x-markdown"];
 /// The basename of the entry, which is also its id in `mimeapps.list`.
 pub const DESKTOP_ID: &str = "mdblaze.desktop";
 
-/// Names this program has shipped under before.
-///
-/// A rename is not just a string change once the program has installed itself
-/// on somebody's machine. The old name left a `.desktop` file, an icon, and --
-/// worst of all -- a line in `mimeapps.list` saying that markdown belongs to it.
-/// Install the new name without touching any of that and the desktop has two
-/// entries claiming the same file type, one of them pointing at a binary that
-/// may not exist any more, and which one wins is up to the desktop.
-///
-/// So installing sweeps the former names out. The list only ever grows.
-pub const FORMER_NAMES: &[&str] = &["mdedit"];
+use super::FORMER_NAMES;
 
 /// Quote a path for a `.desktop` `Exec` line if it needs it.
 fn exec_quote(p: &str) -> String {
@@ -260,9 +241,7 @@ fn forget_former(
         .collect()
 }
 
-fn home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
-}
+use super::home;
 
 fn applications_dir() -> PathBuf {
     home().join(".local/share/applications")
@@ -298,13 +277,7 @@ fn parse_record(s: &str) -> Vec<(String, Option<String>)> {
 }
 
 /// Install the handler and make it the default for markdown.
-pub fn install() -> std::io::Result<Vec<String>> {
-    if !cfg!(target_os = "linux") {
-        return Err(std::io::Error::other(
-            "file associations here are a freedesktop convention; macOS uses an \
-             app bundle's Info.plist and Windows uses the registry, and neither is this",
-        ));
-    }
+pub(super) fn install() -> std::io::Result<Vec<String>> {
     let exe = std::env::current_exe()?;
     let mut said = Vec::new();
 
@@ -323,7 +296,21 @@ pub fn install() -> std::io::Result<Vec<String>> {
     // First, so the report reads in the order things happened -- and so a
     // former name's files are gone before ours are written, rather than both
     // existing for the width of a few syscalls.
-    let inherited = sweep_former(&mut said);
+    let former = sweep_former(&mut said);
+    // Our OWN record from a previous install, and it takes precedence.
+    //
+    // Installing twice is ordinary -- after an upgrade, or after moving the
+    // binary. The second install captures the current default, which is us, and
+    // `forget_former` has to turn that back into whatever was there originally.
+    // Reading only a FORMER name's record was not enough: on the second install
+    // of the same name there is no former record, the lookup found nothing, and
+    // the memory of GNOME Text Editor was quietly replaced with "no default".
+    // Uninstalling would then have left markdown opening with nothing at all.
+    //
+    // Caught by running it twice and reading the report, which said "had no
+    // default" about a file type that certainly had one.
+    let mine = std::fs::read_to_string(record_path()).map(|s| parse_record(&s)).unwrap_or_default();
+    let inherited = if mine.is_empty() { former } else { mine };
 
     let apps = applications_dir();
     std::fs::create_dir_all(&apps)?;
@@ -367,7 +354,7 @@ pub fn install() -> std::io::Result<Vec<String>> {
 }
 
 /// Remove the handler and restore whatever it displaced.
-pub fn uninstall() -> std::io::Result<Vec<String>> {
+pub(super) fn uninstall() -> std::io::Result<Vec<String>> {
     let mut said = Vec::new();
     let apps = applications_dir();
     // A machine that still carries a former name's leftovers should come out of
@@ -570,6 +557,22 @@ mod tests {
         let captured = vec![("text/markdown".to_string(), Some(DESKTOP_ID.to_string()))];
         let inherited = vec![("text/markdown".to_string(), Some("nvim.desktop".to_string()))];
         assert_eq!(forget_former(captured, &inherited)[0].1, Some("nvim.desktop".to_string()));
+    }
+
+    #[test]
+    fn installing_twice_does_not_forget_what_the_first_install_displaced() {
+        // The second install sees ITSELF as the current default. If that is what
+        // gets recorded, uninstalling hands markdown back to us -- or to
+        // nothing -- instead of to the program that had it originally.
+        let original = vec![("text/markdown".to_string(), Some("org.gnome.TextEditor.desktop".to_string()))];
+        // First install recorded the truth; second install captures us.
+        let captured = vec![("text/markdown".to_string(), Some(DESKTOP_ID.to_string()))];
+        let after = forget_former(captured, &original);
+        assert_eq!(
+            after[0].1,
+            Some("org.gnome.TextEditor.desktop".to_string()),
+            "a second install forgot what the first one replaced"
+        );
     }
 
     #[test]

@@ -39,6 +39,12 @@ png = { version = "0.18.1", default-features = false }
 zune-jpeg = { version = "0.5.15", default-features = false, features = ["std"] }
 memmap2 = "0.9.11"
 
+# Windows only, and it costs the other platforms nothing: cargo does not build
+# or fetch it for a target it is not gated to. The registry is the only place
+# Windows keeps file associations, and there is no portable way to reach it.
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+
 [profile.release]
 opt-level = 3
 lto = true
