@@ -5,6 +5,8 @@ edition = "2021"
 description = "A markdown editor that renders, and opens instantly."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+repository = "https://github.com/Redstone-Logic/mdblaze"
+homepage = "https://github.com/Redstone-Logic/mdblaze"
 keywords = ["markdown", "editor", "viewer", "gui", "startup"]
 categories = ["text-editors", "gui", "text-processing"]
 # The Noto faces are compiled in and are SIL OFL 1.1, not MIT/Apache. The SPDX
