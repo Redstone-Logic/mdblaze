@@ -200,9 +200,17 @@ Each archive carries the licences with it, because the Noto faces compiled into
 the binary are under the SIL Open Font License and that text has to travel with
 any copy. See [NOTICE](NOTICE).
 
-Cutting a release is one command — `git push origin vX.Y.Z`. The tag builds the
-four binaries, cuts the GitHub release and publishes the crate, in that order,
-with the irreversible step last. **No crates.io API token exists anywhere in
+Cutting a release is a tag and a push:
+
+```sh
+git tag -a v0.2.1 -m "what changed"
+git push origin v0.2.1
+```
+
+The tag builds the four binaries, cuts the GitHub release and publishes the
+crate, in that order, with the irreversible step last. A `check-version` job
+refuses a tag that disagrees with `Cargo.toml` before any of the slow builds
+start. **No crates.io API token exists anywhere in
 this repository or its secrets**: the publishing job asks GitHub for an OIDC
 token, crates.io trades it for one of its own that lasts minutes, and it is
 revoked when the job ends.

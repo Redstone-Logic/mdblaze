@@ -181,20 +181,40 @@ jobs:
       # workflow is run again on the same tag, the version is already up and
       # `cargo publish` would exit non-zero -- turning a green release red over
       # work that had, in fact, already succeeded. Skipped and said out loud.
+      #
+      # Only 200 and 404 are answers. Anything else -- a rate limit, a 5xx, no
+      # route to the host -- is NOT "the version is missing", and reporting it as
+      # one would put a lie in the log.
       - name: is this version already up?
         id: published
         run: |
           set -eu
           v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           url="https://crates.io/api/v1/crates/mdblaze/$v"
-          if curl -sfL -A "mdblaze release workflow (github.com/Redstone-Logic/mdblaze)" \
-                  -o /dev/null "$url"; then
-            echo "::notice::mdblaze $v is already on crates.io -- nothing to publish"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "mdblaze $v is not on crates.io yet"
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
+          # A User-Agent is not optional: crates.io answers 403 without one.
+          code=$(curl -sL -o /dev/null -w '%{http_code}' --max-time 30 \
+                   -A "mdblaze release workflow (github.com/Redstone-Logic/mdblaze)" \
+                   "$url") || code=000
+          case "$code" in
+            200)
+              echo "::notice::mdblaze $v is already on crates.io -- nothing to publish"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "mdblaze $v is not on crates.io yet"
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              # Carry on, and let `cargo publish` be the judge. It talks to the
+              # same registry, which refuses a duplicate version server-side, so
+              # the worst case is an honest error -- never two of anything.
+              # Stopping here instead would turn a registry hiccup into a failed
+              # release of a version that was never up, which is the more common
+              # and the more expensive mistake.
+              echo "::warning::crates.io answered $code, neither 200 nor 404 -- cannot tell whether $v is up; letting cargo publish decide"
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
 
       # `@v1` is a moving BRANCH in that repository, not a tag -- there is no `v1`
       # tag, only `v1.0.x` -- so this follows their v1 line the same way
