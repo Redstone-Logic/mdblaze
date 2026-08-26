@@ -110,7 +110,7 @@ impl Prompt {
         // prefilled produces `/home/me/project//tmp/notes.md` -- the two glued
         // together -- and Enter then reports that no such file exists. Found by
         // driving the real window and doing exactly that.
-        if self.fresh && (ch == '/' || ch == '~') {
+        if self.fresh && (std::path::is_separator(ch) || ch == '~') {
             self.text.clear();
             self.cursor = 0;
         }
@@ -208,7 +208,7 @@ impl Prompt {
         let only_one = hits.len() == 1;
         let mut done = dir.join(&common).to_string_lossy().to_string();
         if only_one && hits[0].1 {
-            done.push('/');
+            done.push(SEP);
         }
         self.note = if only_one { None } else { Some(format!("{} matches", hits.len())) };
         self.text = done;
@@ -290,8 +290,8 @@ impl Prompt {
             dir.join(&entry.name)
         };
         let mut t = target.to_string_lossy().to_string();
-        if entry.is_dir && !t.ends_with('/') {
-            t.push('/');
+        if entry.is_dir && !ends_with_sep(&t) {
+            t.push(SEP);
         }
         self.text = t;
         self.cursor = self.text.len();
@@ -302,14 +302,27 @@ impl Prompt {
     }
 }
 
+/// The platform's separator, as a character.
+///
+/// Not a hardcoded `/`. Windows uses `\\`, and `std::path::is_separator`
+/// accepts both there, so paths typed either way work while the ones this
+/// program APPENDS look native.
+const SEP: char = std::path::MAIN_SEPARATOR;
+
+/// Does this string already end in a separator?
+fn ends_with_sep(s: &str) -> bool {
+    s.chars().next_back().is_some_and(std::path::is_separator)
+}
+
 /// Expand a leading `~`, and nothing else. `$VARS` are deliberately not
 /// expanded: this is a filename, and a file called `$HOME` should be openable.
 fn expand(s: &str, home: &Path) -> PathBuf {
     if s == "~" {
         return home.to_path_buf();
     }
-    if let Some(rest) = s.strip_prefix("~/") {
-        return home.join(rest);
+    let after = s.strip_prefix('~').filter(|r| r.starts_with(std::path::is_separator));
+    if let Some(rest) = after {
+        return home.join(&rest[1..]);
     }
     PathBuf::from(s)
 }
@@ -323,8 +336,8 @@ fn expand(s: &str, home: &Path) -> PathBuf {
 /// `Path` meant typing a dot to reach the dotfiles silently filtered nothing.
 fn split(p: &Path) -> (PathBuf, String) {
     let s = p.to_string_lossy().to_string();
-    match s.rfind('/') {
-        Some(i) => (PathBuf::from(&s[..=i]), s[i + 1..].to_string()),
+    match s.char_indices().rev().find(|(_, c)| std::path::is_separator(*c)) {
+        Some((i, c)) => (PathBuf::from(&s[..i + c.len_utf8()]), s[i + c.len_utf8()..].to_string()),
         None if s.is_empty() => (PathBuf::from("."), String::new()),
         None => (PathBuf::from("."), s),
     }
@@ -466,6 +479,28 @@ mod tests {
     }
 
     #[test]
+    fn paths_are_split_on_the_platforms_own_separator() {
+        // Hardcoding `/` meant that on Windows nothing was ever split: every
+        // path came back as a bare filename in ".", so the listing was empty and
+        // completion matched nothing. Caught by CI on a Windows runner, which is
+        // the only place it could have been caught.
+        let (dir, stem) = split(Path::new(&format!("{SEP}a{SEP}b{SEP}note.md")));
+        assert_eq!(stem, "note.md");
+        assert!(ends_with_sep(&dir.to_string_lossy()), "{}", dir.display());
+        // A bare name has no directory part.
+        assert_eq!(split(Path::new("note.md")).1, "note.md");
+        // And a trailing separator is all directory.
+        assert_eq!(split(Path::new(&format!("{SEP}a{SEP}"))).1, "");
+    }
+
+    #[test]
+    fn a_tilde_expands_before_either_separator() {
+        let home = Path::new("/home/someone");
+        let typed = format!("~{SEP}notes.md");
+        assert_eq!(Prompt::new(Intent::Open, &typed).path(home), home.join("notes.md"));
+    }
+
+    #[test]
     fn a_dollar_sign_is_part_of_the_filename() {
         // This is a path, not a shell command. A file called `$HOME` opens.
         let home = Path::new("/home/someone");
@@ -504,7 +539,7 @@ mod tests {
         std::fs::create_dir_all(d.join("drafts")).unwrap();
         let mut p = Prompt::new(Intent::Open, &d.join("dra").to_string_lossy());
         p.complete(Path::new("/nonexistent"));
-        assert!(p.text().ends_with("drafts/"), "{}", p.text());
+        assert!(p.text().ends_with(&format!("drafts{SEP}")), "{}", p.text());
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -532,7 +567,7 @@ mod tests {
         let d = dir();
         std::fs::write(d.join(".hidden.md"), "x").unwrap();
         std::fs::write(d.join("visible.md"), "x").unwrap();
-        let mut p = Prompt::new(Intent::Open, &format!("{}/", d.to_string_lossy()));
+        let mut p = Prompt::new(Intent::Open, &format!("{}{SEP}", d.to_string_lossy()));
         p.complete(Path::new("/nonexistent"));
         assert!(p.text().ends_with("visible.md"), "a dotfile was offered: {}", p.text());
 
@@ -570,7 +605,7 @@ mod tests {
         // Sorted purely alphabetically, folders are buried among the files and
         // getting anywhere becomes a hunt.
         let d = populated();
-        let mut p = Prompt::new(Intent::Open, &format!("{}/", d.to_string_lossy()));
+        let mut p = Prompt::new(Intent::Open, &format!("{}{SEP}", d.to_string_lossy()));
         let e = p.entries(Path::new("/nonexistent"));
         let names: Vec<&str> = e.iter().map(|x| x.name.as_str()).collect();
         assert_eq!(names[0], "..", "the parent is always first");
@@ -582,7 +617,7 @@ mod tests {
     #[test]
     fn typing_filters_the_listing_without_rereading_the_directory() {
         let d = populated();
-        let mut p = Prompt::new(Intent::Open, &format!("{}/", d.to_string_lossy()));
+        let mut p = Prompt::new(Intent::Open, &format!("{}{SEP}", d.to_string_lossy()));
         assert!(p.entries(Path::new("/nonexistent")).len() > 3);
         for c in "al".chars() {
             p.insert(c);
@@ -608,7 +643,7 @@ mod tests {
     #[test]
     fn the_listing_hides_dotfiles_until_asked_for() {
         let d = populated();
-        let mut p = Prompt::new(Intent::Open, &format!("{}/", d.to_string_lossy()));
+        let mut p = Prompt::new(Intent::Open, &format!("{}{SEP}", d.to_string_lossy()));
         assert!(p.entries(Path::new("/nonexistent")).iter().all(|e| e.name != ".hidden.md"));
         let mut q = Prompt::new(Intent::Open, &d.join(".").to_string_lossy());
         assert!(q.entries(Path::new("/nonexistent")).iter().any(|e| e.name == ".hidden.md"));
@@ -620,22 +655,22 @@ mod tests {
         // Two arrow keys and Enter, with no path typed at all -- which is the
         // whole reason the listing exists.
         let d = populated();
-        let mut p = Prompt::new(Intent::Open, &format!("{}/", d.to_string_lossy()));
+        let mut p = Prompt::new(Intent::Open, &format!("{}{SEP}", d.to_string_lossy()));
         let e = p.entries(Path::new("/nonexistent"));
         let drafts = e.iter().find(|x| x.name == "drafts").expect("drafts").clone();
         p.take(&drafts, Path::new("/nonexistent"));
-        assert!(p.text().ends_with("drafts/"), "{}", p.text());
+        assert!(p.text().ends_with(&format!("drafts{SEP}")), "{}", p.text());
         std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn choosing_the_parent_goes_up() {
         let d = populated();
-        let mut p = Prompt::new(Intent::Open, &format!("{}/", d.to_string_lossy()));
+        let mut p = Prompt::new(Intent::Open, &format!("{}{SEP}", d.to_string_lossy()));
         let up = Entry { name: "..".into(), is_dir: true };
         p.take(&up, Path::new("/nonexistent"));
         assert_eq!(
-            PathBuf::from(p.text().trim_end_matches('/')),
+            PathBuf::from(p.text().trim_end_matches(std::path::is_separator)),
             d.parent().unwrap(),
             "did not land in the parent"
         );

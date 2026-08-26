@@ -145,8 +145,10 @@ impl App {
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default();
         let mut s = dir.to_string_lossy().to_string();
-        if !s.ends_with('/') {
-            s.push('/');
+        // The platform's own separator, so a seeded path looks native on
+        // Windows rather than mixing the two.
+        if !s.chars().next_back().is_some_and(std::path::is_separator) {
+            s.push(std::path::MAIN_SEPARATOR);
         }
         s
     }
