@@ -62,11 +62,26 @@ mdblaze --timing notes.md # and say where the milliseconds went
 | | |
 |---|---|
 | **click** | put the caret there — that block reveals its markdown |
-| **Ctrl+S** | save, atomically |
+| **Ctrl+O** | open a file — or drop one on the window |
+| **Ctrl+S** | save, atomically. On an unnamed buffer it asks where |
 | **Ctrl+Z** / **Ctrl+Y** | undo, redo |
 | **Esc** | close — twice, quickly, to discard unsaved changes |
 
 Arrows, Home, End, PageUp and PageDown do what they do everywhere.
+
+### Opening a file
+
+<div align="center">
+<img src="docs/opening.png" width="720" alt="the file listing open over a document, with a directory highlighted and a path being typed below it">
+</div>
+
+Arrows and Enter, or type the path — Tab completes it the way a shell does.
+Directories come first, Enter goes into one, `..` goes back up. Save-as uses the
+same line, so a buffer you started from nothing has somewhere to go.
+
+It is drawn with the same renderer as the document, not by a toolkit. A native
+dialog means a D-Bus round trip to a portal service that may not be running, and
+this whole program reaches first frame in the time that call takes to return.
 
 ## It renders the markdown you actually write
 

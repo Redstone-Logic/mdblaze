@@ -31,6 +31,13 @@ pub struct Theme {
     pub caret: u32,
     /// The status bar while unsaved work is one keypress from being discarded.
     pub alarm_bg: u32,
+    /// The highlighted row in the file listing.
+    ///
+    /// Its own token rather than reusing the caret's crimson: the caret is a
+    /// two-pixel line and reads as an accent, while the same colour across a
+    /// whole row reads as an alarm. This is the accent with most of the
+    /// saturation taken out, so it says "here" without saying "careful".
+    pub select: u32,
 }
 
 impl Theme {
@@ -55,6 +62,7 @@ impl Theme {
         bar: 0x001b_1b1b,
         caret: 0x00b6_3c35,
         alarm_bg: 0x0053_1f1c,
+        select: 0x0035_2320,
     };
 
     fn of(&self, ink: Ink) -> u32 {
@@ -377,6 +385,89 @@ fn draw_text(
         pen += g.advance;
     }
     pen
+}
+
+/// Draw the path prompt where the status line normally is.
+///
+/// It replaces the status line rather than sitting above it, because the status
+/// line's job -- what file, whether it is modified -- is not what you need while
+/// you are naming a file, and a second bar would move the document.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_prompt(
+    text: &mut Text,
+    buf: &mut [u32],
+    width: usize,
+    height: usize,
+    base: f32,
+    theme: &Theme,
+    label: &str,
+    typed: &str,
+    caret_chars: usize,
+    note: Option<&str>,
+    entries: &[crate::prompt::Entry],
+    selected: usize,
+    first: usize,
+) {
+    let bar = status_height(base);
+    let row = base * 1.5;
+    let shown = entries.len().saturating_sub(first).min(crate::prompt::VISIBLE);
+    let list_h = shown as f32 * row;
+    let list_top = height as f32 - bar - list_h;
+
+    // The listing sits on its own ground so it reads as something over the
+    // document rather than as part of it.
+    if shown > 0 {
+        fill(buf, width, height, 0.0, list_top, width as f32, list_h, theme.bar);
+        let px = base * 0.82;
+        for (i, e) in entries.iter().skip(first).take(shown).enumerate() {
+            let y = list_top + i as f32 * row;
+            let here = first + i == selected;
+            if here {
+                fill(buf, width, height, 0.0, y, width as f32, row, theme.select);
+            }
+            let ink = if here {
+                theme.strong
+            } else if e.is_dir {
+                theme.link
+            } else {
+                theme.body
+            };
+            // A trailing separator on directories, which is how every listing
+            // in the world says "you can go in here".
+            let name =
+                if e.is_dir && e.name != ".." { format!("{}/", e.name) } else { e.name.clone() };
+            let face = if e.is_dir { Face::SansBold } else { Face::Sans };
+            draw_text(text, buf, width, height, PAD * 1.5, y + row * 0.72, &name, face, px, ink);
+        }
+    }
+
+    let top = height as f32 - bar;
+    fill(buf, width, height, 0.0, top, width as f32, bar, theme.bar);
+    let px = base * 0.78;
+    let baseline = top + bar * 0.5 + px * 0.36;
+
+    let mut x = draw_text(
+        text, buf, width, height, PAD, baseline, label, Face::SansBold, px, theme.strong,
+    );
+    x += base * 0.5;
+
+    // The caret is drawn from the width of what is BEFORE it rather than from a
+    // character count times an average, because the face is proportional and the
+    // second answer is wrong by a growing amount as the path gets longer.
+    let before: String = typed.chars().take(caret_chars).collect();
+    let caret_x = x + text.width(Face::Mono, &before, px);
+    let end = draw_text(text, buf, width, height, x, baseline, typed, Face::Mono, px, theme.body);
+    fill(buf, width, height, caret_x, baseline - px * 0.85, 2.0, px * 1.15, theme.caret);
+
+    if let Some(n) = note {
+        let nx = (end + base).max(width as f32 * 0.62);
+        draw_text(text, buf, width, height, nx, baseline, n, Face::Sans, px, theme.dim);
+    } else {
+        let hint = "Tab completes  ·  Enter opens  ·  Esc cancels";
+        let hw = text.width(Face::Sans, hint, px);
+        let hx = (width as f32 - PAD - hw).max(end + base);
+        draw_text(text, buf, width, height, hx, baseline, hint, Face::Sans, px, theme.dim);
+    }
 }
 
 /// How tall the status line is at a given base size.

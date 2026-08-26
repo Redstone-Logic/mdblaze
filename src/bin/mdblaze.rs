@@ -37,6 +37,7 @@ use mdblaze::edit::Buffer;
 use mdblaze::file;
 use mdblaze::layout::{self, Editing, Laid};
 use mdblaze::media::Media;
+use mdblaze::prompt::{Intent, Prompt};
 use mdblaze::render::{self, Scaled, Theme};
 use mdblaze::text::Text;
 
@@ -80,6 +81,10 @@ struct App {
     /// is reparsed on every keystroke and decoding a screenshot is milliseconds;
     /// without this, typing beside a picture would be visibly slow.
     media: Media,
+    /// The path being typed, when a path is being typed. `None` costs nothing:
+    /// no directory is read and no widget exists until Ctrl+O or a save with no
+    /// filename asks for one.
+    prompt: Option<Prompt>,
     /// Pictures at the size they are on screen. Rebuilding them every frame cost
     /// fifteen milliseconds a keystroke; see [`Scaled`].
     scaled: Scaled,
@@ -130,6 +135,73 @@ impl App {
         self.laid_for = width;
     }
 
+    /// Where a path prompt should start from: beside the open document, or the
+    /// working directory when there is none.
+    fn near(&self) -> String {
+        let dir = self
+            .path
+            .as_ref()
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default();
+        let mut s = dir.to_string_lossy().to_string();
+        if !s.ends_with('/') {
+            s.push('/');
+        }
+        s
+    }
+
+    fn ask(&mut self, intent: Intent) {
+        let start = self.near();
+        self.prompt = Some(Prompt::new(intent, &start));
+        self.note = None;
+    }
+
+    /// Open `path`, replacing what is on screen.
+    ///
+    /// The media cache is rebuilt rather than kept: it is keyed by URL and
+    /// resolved against the OLD document's directory, so carrying it over would
+    /// answer a relative path with the previous file's picture.
+    fn open(&mut self, path: std::path::PathBuf, width: f32) {
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                self.buffer = Buffer::from_str(&text);
+                self.media = Media::for_document(Some(&path));
+                self.scaled = Scaled::default();
+                self.path = Some(path);
+                self.scroll = 0.0;
+                self.armed_at = None;
+                self.reflow(width);
+                if let Some(w) = &self.window {
+                    w.set_title(&self.title());
+                }
+            }
+            Err(e) => self.say(&format!("could not open: {e}")),
+        }
+    }
+
+    /// Act on a confirmed prompt. Returns true if anything changed on screen.
+    fn confirm(&mut self, width: f32) -> bool {
+        let Some(p) = self.prompt.take() else { return false };
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+        let path = p.path(&home);
+        if path.as_os_str().is_empty() {
+            return true;
+        }
+        match p.intent {
+            Intent::Open => self.open(path, width),
+            Intent::SaveAs => {
+                self.path = Some(path);
+                self.media = Media::for_document(self.path.as_deref());
+                self.save();
+                if let Some(w) = &self.window {
+                    w.set_title(&self.title());
+                }
+            }
+        }
+        true
+    }
+
     fn ms(&self) -> u128 {
         self.started.elapsed().as_millis()
     }
@@ -140,7 +212,11 @@ impl App {
 
     fn save(&mut self) {
         let Some(path) = self.path.clone() else {
-            self.say("no filename — open a file to save it");
+            // Not an error and not a refusal. A buffer with no filename is one
+            // that has never been given one, so ask for it -- the previous
+            // answer, "open a file to save it", was circular and left typed
+            // work with nowhere to go.
+            self.ask(Intent::SaveAs);
             return;
         };
         match file::save_atomic(&path, &self.buffer.text()) {
@@ -252,6 +328,19 @@ impl ApplicationHandler for App {
                     window.request_redraw();
                 }
             }
+            // Dropping a file on the window opens it. winit already delivers
+            // this; not handling it was the difference between "you cannot open
+            // a file from the UI" and one match arm.
+            WindowEvent::DroppedFile(path) => {
+                let w = window.inner_size().width as f32;
+                if self.buffer.is_dirty() {
+                    self.say("unsaved changes — Ctrl+S first");
+                } else {
+                    self.open(path, w);
+                }
+                window.request_redraw();
+            }
+
             WindowEvent::ModifiersChanged(m) => self.mods = m,
 
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
@@ -266,7 +355,111 @@ impl ApplicationHandler for App {
                 // caret.
                 let mut touched = true;
 
+                // A prompt takes the keyboard while it is up. Every branch
+                // below assumes it is editing the DOCUMENT, and letting a
+                // filename fall through to that would type it into the file.
+                if self.prompt.is_some() {
+                    let w = size.width as f32;
+                    let home =
+                        std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Escape) => self.prompt = None,
+                        Key::Named(NamedKey::Enter) => {
+                            // Enter takes the highlighted entry when there is
+                            // one, so the whole thing works with arrows alone.
+                            // A directory descends instead of opening, because
+                            // opening a directory is not a thing.
+                            let saving = self.prompt.as_ref().map(|p| p.intent) == Some(Intent::SaveAs);
+                            let picked = self.prompt.as_mut().and_then(|p| {
+                                let e = p.entries(&home);
+                                // While saving, only a DIRECTORY is worth
+                                // taking from the list: the file being named
+                                // does not exist yet, so the typed text is the
+                                // answer.
+                                e.get(p.selected).filter(|e| !saving || e.is_dir).cloned()
+                            });
+                            match picked {
+                                Some(e) if e.is_dir => {
+                                    if let Some(p) = self.prompt.as_mut() {
+                                        p.take(&e, &home);
+                                    }
+                                }
+                                Some(e) => {
+                                    if let Some(p) = self.prompt.as_mut() {
+                                        p.take(&e, &home);
+                                    }
+                                    self.confirm(w);
+                                }
+                                None => {
+                                    self.confirm(w);
+                                }
+                            }
+                        }
+                        Key::Named(NamedKey::ArrowDown) => {
+                            if let Some(p) = self.prompt.as_mut() {
+                                let n = p.entries(&home).len();
+                                p.move_by(1, n);
+                            }
+                        }
+                        Key::Named(NamedKey::ArrowUp) => {
+                            if let Some(p) = self.prompt.as_mut() {
+                                let n = p.entries(&home).len();
+                                p.move_by(-1, n);
+                            }
+                        }
+                        Key::Named(NamedKey::Tab) => {
+                            if let Some(p) = self.prompt.as_mut() {
+                                p.complete(&home);
+                            }
+                        }
+                        Key::Named(NamedKey::Backspace) => {
+                            if let Some(p) = self.prompt.as_mut() {
+                                p.backspace();
+                            }
+                        }
+                        Key::Named(NamedKey::Space) => {
+                            if let Some(p) = self.prompt.as_mut() {
+                                p.insert(' ');
+                            }
+                        }
+                        Key::Named(NamedKey::ArrowLeft) => {
+                            if let Some(p) = self.prompt.as_mut() {
+                                p.left();
+                            }
+                        }
+                        Key::Named(NamedKey::ArrowRight) => {
+                            if let Some(p) = self.prompt.as_mut() {
+                                p.right();
+                            }
+                        }
+                        Key::Named(NamedKey::Home) => {
+                            if let Some(p) = self.prompt.as_mut() {
+                                p.home();
+                            }
+                        }
+                        Key::Named(NamedKey::End) => {
+                            if let Some(p) = self.prompt.as_mut() {
+                                p.end();
+                            }
+                        }
+                        Key::Character(c) if !ctrl => {
+                            if let Some(p) = self.prompt.as_mut() {
+                                for ch in c.chars() {
+                                    p.insert(ch);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    window.request_redraw();
+                    return;
+                }
+
                 match &event.logical_key {
+                    Key::Character(c) if ctrl && c.eq_ignore_ascii_case("o") => {
+                        self.ask(Intent::Open);
+                        touched = false;
+                    }
                     Key::Character(c) if ctrl && c.eq_ignore_ascii_case("s") => {
                         self.save();
                         touched = false;
@@ -415,6 +608,19 @@ impl ApplicationHandler for App {
                 let note = self.note.as_ref().map(|(t, _)| t.clone());
                 let scroll = self.scroll;
 
+                let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+                let showing = self.prompt.as_mut().map(|p| {
+                    let entries = p.entries(&home);
+                    (
+                        p.intent.label(),
+                        p.text().to_string(),
+                        p.caret_chars(),
+                        p.note.clone(),
+                        entries,
+                        p.selected,
+                        p.top,
+                    )
+                });
                 let surface = self.surface.as_mut().expect("surface");
                 surface.resize(w, h).expect("resize");
                 let mut buf = surface.buffer_mut().expect("buffer");
@@ -422,10 +628,16 @@ impl ApplicationHandler for App {
                     &self.laid, &mut self.text, &mut self.scaled, &mut buf, width, height,
                     scroll, &Theme::DARK,
                 );
-                render::draw_status(
-                    &mut self.text, &mut buf, width, height, BASE, &Theme::DARK, &name, dirty,
-                    note.as_deref(), armed,
-                );
+                match &showing {
+                    Some((label, typed, caret, note, entries, sel, top)) => render::draw_prompt(
+                        &mut self.text, &mut buf, width, height, BASE, &Theme::DARK,
+                        label, typed, *caret, note.as_deref(), entries, *sel, *top,
+                    ),
+                    None => render::draw_status(
+                        &mut self.text, &mut buf, width, height, BASE, &Theme::DARK, &name, dirty,
+                        note.as_deref(), armed,
+                    ),
+                }
                 buf.present().expect("present");
 
                 if self.timing && !self.reported {
@@ -515,7 +727,13 @@ fn main() {
                 std::process::exit(1);
             }
         },
-        None => "# mdblaze\n\nPass a markdown file to open it.\n".to_string(),
+        None => concat!(
+            "# mdblaze\n\n",
+            "**Ctrl+O** to open a file, or drop one on this window.\n\n",
+            "Start typing and **Ctrl+S** will ask where to put it.\n\n",
+            "From a terminal: `mdblaze notes.md`\n",
+        )
+        .to_string(),
     };
 
     let text = Text::new();
@@ -590,6 +808,7 @@ fn main() {
         buffer,
         text,
         media,
+        prompt: None,
         scaled: Scaled::default(),
         laid,
         laid_for: 900.0,
