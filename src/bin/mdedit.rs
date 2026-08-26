@@ -61,6 +61,14 @@ const DISCARD_MS: u128 = 1_500;
 
 const BASE: f32 = mdedit::text::BODY_PX;
 
+/// How the person asked to close, so the warning can name that gesture back to
+/// them rather than describing a different one.
+#[derive(Clone, Copy)]
+enum Route {
+    Escape,
+    CloseButton,
+}
+
 struct App {
     t0: Instant,
     started: Instant,
@@ -142,7 +150,7 @@ impl App {
     /// out of a window -- Escape, the title bar's close button, the window
     /// manager -- and a guard that only covers the one you thought of is not a
     /// guard. It is a promise that fails on the path nobody tested.
-    fn may_close(&mut self) -> bool {
+    fn may_close(&mut self, via: Route) -> bool {
         if !self.buffer.is_dirty() {
             return true;
         }
@@ -150,7 +158,17 @@ impl App {
             return true;
         }
         self.armed_at = Some(Instant::now());
-        self.say("UNSAVED — Ctrl+S to save, or close again now to discard");
+        // Names the gesture the person just made, and says it has to be QUICK.
+        // "Press again to close" is true and useless: it does not say that the
+        // offer expires, so a second press a minute later feels like it should
+        // work -- and the first version of this message let it.
+        self.say(&format!(
+            "UNSAVED CHANGES — Ctrl+S to save · {} to discard",
+            match via {
+                Route::Escape => "double-tap Esc quickly",
+                Route::CloseButton => "click close twice quickly",
+            }
+        ));
         false
     }
 
@@ -209,7 +227,7 @@ impl ApplicationHandler for App {
                 // with unsaved changes could be lost by clicking the one control
                 // every window has. Escape was guarded and this was not, which is
                 // the worse half to miss.
-                if self.may_close() {
+                if self.may_close(Route::CloseButton) {
                     el.exit();
                 } else {
                     window.request_redraw();
@@ -250,7 +268,7 @@ impl ApplicationHandler for App {
                     Key::Character(_) if ctrl => touched = false,
 
                     Key::Named(NamedKey::Escape) => {
-                        if self.may_close() {
+                        if self.may_close(Route::Escape) {
                             el.exit();
                         }
                         touched = false;
