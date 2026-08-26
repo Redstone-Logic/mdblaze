@@ -25,7 +25,7 @@ Nothing lives in the gap between "shows me the document" and "is already open".
 That gap is the whole of this program.
 
 <div align="center">
-<img src="docs/rendered.png" width="720" alt="mdblaze showing a rendered markdown document with a table, highlighted Rust, and colour emoji">
+<img src="docs/rendered.png" width="720" alt="mdblaze in a window, showing a rendered markdown document with a table, highlighted Rust, and colour emoji">
 </div>
 
 ## Editing is the same window
