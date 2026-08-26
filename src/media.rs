@@ -167,19 +167,36 @@ impl Media {
 
 /// Does this look like `scheme:` rather than a path?
 ///
-/// Deliberately strict about what a scheme is -- a letter followed by letters,
-/// digits, `+`, `-` or `.` and then a colon -- so that a file called
-/// `notes:2026.png` is a file and not a protocol.
+/// Deliberately strict about what a scheme is -- a letter, then AT LEAST ONE
+/// more letter, digit, `+`, `-` or `.`, and then a colon -- so that a file
+/// called `notes:2026.png` is a file and not a protocol.
+///
+/// # Why the second character is required
+///
+/// `C:\Users\Someone\shot.png` is an absolute path on Windows and a
+/// one-letter scheme by RFC 3986, which permits them. Treating it as a scheme
+/// meant every absolute path on Windows was refused as though it were a URL, so
+/// no picture referenced by full path ever loaded there.
+///
+/// Found by CI on the second run it ever did, on a Windows runner, resolving a
+/// path under `D:\a\`. Nothing on this machine could have produced it: on
+/// Linux there are no drive letters to mistake.
+///
+/// A one-letter scheme is permitted by the RFC and does not occur in practice;
+/// a one-letter drive is the normal case on one of the three platforms this
+/// runs on. So the ambiguity is resolved in favour of the file.
 fn has_scheme(s: &str) -> bool {
     let mut chars = s.chars();
     match chars.next() {
         Some(c) if c.is_ascii_alphabetic() => {}
         _ => return false,
     }
+    let mut seen = 0usize;
     for c in chars {
         match c {
-            ':' => return true,
-            c if c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.' => {}
+            // A colon with only one character before it is a drive letter.
+            ':' => return seen > 0,
+            c if c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.' => seen += 1,
             _ => return false,
         }
     }
@@ -308,6 +325,22 @@ mod tests {
         assert_eq!(m.resolve("https://example.com/a.png"), None);
         assert_eq!(m.resolve("data:image/png,x"), None);
         assert_eq!(m.resolve("javascript:alert(1)"), None);
+    }
+
+    #[test]
+    fn a_windows_drive_letter_is_a_path_and_not_a_url_scheme() {
+        // `C:\...` is an absolute path on Windows and a legal one-letter scheme
+        // by RFC 3986. Read as a scheme, every absolute path on Windows was
+        // refused as remote and no picture behind one ever loaded.
+        //
+        // Asserted on every platform, not just Windows, because the rule is
+        // about the STRING and a rule only checked where it already works is
+        // not checked at all.
+        assert!(!has_scheme("C:\\Users\\Someone\\shot.png"));
+        assert!(!has_scheme("D:/pictures/x.png"));
+        for s in ["https://x/y.png", "http://x", "data:image/png,x", "file:///x", "javascript:x"] {
+            assert!(has_scheme(s), "{s} stopped being recognised as a URL");
+        }
     }
 
     #[test]

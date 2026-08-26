@@ -141,6 +141,11 @@ at the exact moment someone asked for their work to be kept.
 - **Noto Sans, whatever you have installed.** No coverage for scripts the
   embedded faces lack -- CJK, Arabic, Devanagari render as missing glyphs. The
   fix is to embed more coverage, not to start asking the system.
+- **Absolute Windows paths took a fix that only a Windows runner could find.**
+  `C:\...` is a legal one-letter URL scheme by RFC 3986 and an absolute path on
+  one of the three platforms this runs on, so the ambiguity is resolved in
+  favour of the file: a scheme now needs at least two characters before the
+  colon. Before that, every absolute path on Windows was refused as remote.
 - **Pictures are local, and PNG or JPEG.** A markdown file arrives from
   anywhere, and one that says `![](https://...)` is asking this program to tell
   a stranger which files you open and when. Remote images are not fetched and
