@@ -266,7 +266,11 @@ mod tests {
 
     #[test]
     fn the_bundle_goes_in_the_users_applications_folder() {
+        // Compared as PATH COMPONENTS rather than as a string: `join` uses a
+        // backslash on Windows, and this module's tests run there too.
         let p = bundle_path("mdblaze");
-        assert!(p.to_string_lossy().ends_with("Applications/mdblaze.app"), "{}", p.display());
+        let tail: Vec<_> = p.components().rev().take(2).collect();
+        assert_eq!(tail[0].as_os_str(), "mdblaze.app");
+        assert_eq!(tail[1].as_os_str(), "Applications");
     }
 }

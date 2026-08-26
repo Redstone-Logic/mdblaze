@@ -152,10 +152,10 @@ fn png(bytes: &[u8]) -> Option<Bitmap> {
     let (w, h) = (frame.width as usize, frame.height as usize);
     let raw = &buf[..frame.buffer_size()];
     let px = match frame.color_type {
-        png::ColorType::Rgba => raw.chunks_exact(4).map(|c| pack(c[3], c[0], c[1], c[2])).collect(),
-        png::ColorType::Rgb => raw.chunks_exact(3).map(|c| pack(255, c[0], c[1], c[2])).collect(),
+        png::ColorType::Rgba => raw.as_chunks::<4>().0.iter().map(|c| pack(c[3], c[0], c[1], c[2])).collect(),
+        png::ColorType::Rgb => raw.as_chunks::<3>().0.iter().map(|c| pack(255, c[0], c[1], c[2])).collect(),
         png::ColorType::GrayscaleAlpha => {
-            raw.chunks_exact(2).map(|c| pack(c[1], c[0], c[0], c[0])).collect()
+            raw.as_chunks::<2>().0.iter().map(|c| pack(c[1], c[0], c[0], c[0])).collect()
         }
         png::ColorType::Grayscale => raw.iter().map(|g| pack(255, *g, *g, *g)).collect(),
         // Indexed survives EXPAND, so reaching here means the transformations
@@ -175,7 +175,7 @@ fn jpeg(bytes: &[u8]) -> Option<Bitmap> {
     let raw = dec.decode().ok()?;
     // JPEG has no alpha, and the decoder is asked for nothing but RGB.
     let px: Vec<u32> = match raw.len() / (w * h) {
-        3 => raw.chunks_exact(3).map(|c| pack(255, c[0], c[1], c[2])).collect(),
+        3 => raw.as_chunks::<3>().0.iter().map(|c| pack(255, c[0], c[1], c[2])).collect(),
         1 => raw.iter().map(|g| pack(255, *g, *g, *g)).collect(),
         _ => return None,
     };

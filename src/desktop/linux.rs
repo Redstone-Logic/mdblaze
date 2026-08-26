@@ -1,3 +1,9 @@
+// Compiled on every platform so the string handling below stays testable on any
+// machine, but only CALLED on Linux -- so off Linux the private half is dead by
+// construction. Allowed there and nowhere else: on Linux, dead code here is
+// still an error, which is where it would actually mean something.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 //! The freedesktop half: a `.desktop` entry and `mimeapps.list`.
 //!
 //! On Linux, being the opener for a file type is two facts in two files. A

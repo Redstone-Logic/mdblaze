@@ -350,7 +350,13 @@ mod tests {
         // some other document, which is worse than finding none.
         let m = Media::for_document(None);
         assert_eq!(m.resolve("shot.png"), None);
-        assert_eq!(m.resolve("/absolute/shot.png"), Some(PathBuf::from("/absolute/shot.png")));
+        // An absolute path still resolves to itself -- but what counts as
+        // absolute is a platform question. `/foo` is a root-relative path on
+        // Windows, not an absolute one, so the test asks the platform rather
+        // than assuming POSIX.
+        let absolute = std::env::current_dir().expect("a working directory").join("shot.png");
+        assert!(absolute.is_absolute());
+        assert_eq!(m.resolve(&absolute.to_string_lossy()), Some(absolute));
     }
 
     #[test]
