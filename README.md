@@ -155,9 +155,12 @@ Prebuilt binaries for Linux, macOS (Apple silicon and Intel) and Windows are on
 the [releases page](https://github.com/Redstone-Logic/mdblaze/releases), with a
 `SHA256SUMS` alongside them.
 
-The Linux build is made on an older distribution on purpose: a binary links
-against the glibc it was built with, and one built on the newest image refuses to
-start on anything older.
+The Linux build is made inside Debian 12 on purpose. A binary demands the glibc
+it was linked against, so one built on a current CI image refuses to load on most
+of the distributions people run — Debian 12 answers `version 'GLIBC_2.39' not
+found` and stops there. Built in bookworm the floor is **glibc 2.34**, verified
+running on Debian 12, Ubuntu 22.04 and Rocky 9. Debian 11 is the first release it
+does not reach.
 
 Each archive carries the licences with it, because the Noto faces compiled into
 the binary are under the SIL Open Font License and that text has to travel with

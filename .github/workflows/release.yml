@@ -31,15 +31,30 @@ jobs:
     needs: check-version
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container || '' }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # 22.04 rather than latest, deliberately: the binary links against the
-          # builder's glibc, and building on the newest image produces something
-          # that refuses to start on any older distribution.
+          # Built INSIDE Debian 12 rather than on whatever the runner image
+          # happens to be. A binary demands the glibc it was linked against, and
+          # the newest runner produces one that will not start on most of the
+          # distributions people actually run:
+          #
+          #   built on ubuntu-latest (2.39) -> Debian 12 says
+          #     "version `GLIBC_2.39' not found" and refuses to load
+          #
+          # Built in bookworm the floor comes out at GLIBC_2.34 -- lower than the
+          # container's own 2.36, because that is as high as this code reaches.
+          # Verified to run on Debian 12, Ubuntu 22.04 and Rocky 9; Debian 11
+          # (2.31) is the first one it misses.
+          #
+          # A container rather than the ubuntu-22.04 runner because that image is
+          # being retired, and a release pipeline that stops working when GitHub
+          # removes an image is a release pipeline that fails at the worst time.
           - name: linux-x86_64
-            os: ubuntu-22.04
+            os: ubuntu-latest
+            container: rust:1-bookworm
             target: x86_64-unknown-linux-gnu
           - name: macos-arm64
             os: macos-latest
@@ -52,15 +67,19 @@ jobs:
             target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
+
+      # The Linux job already has a toolchain: it is a rust image. The others
+      # need one installed.
       - uses: dtolnay/rust-toolchain@stable
+        if: matrix.container == ''
         with:
           targets: ${{ matrix.target }}
 
       - name: system libraries
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxkbcommon-x11-dev
+          apt-get update
+          apt-get install -y libxkbcommon-dev libwayland-dev libxkbcommon-x11-dev
 
       - run: cargo build --release --locked --target ${{ matrix.target }}
 
