@@ -918,7 +918,9 @@ fn lay_revealed(
             // The caret, if it falls inside this word.
             let start = at + consumed;
             if e.cursor >= start && e.cursor <= start + word.len() && out.caret.is_none() {
-                let upto = &word[..(e.cursor - start).min(word.len())];
+                // Through `boundary`, because the cursor is caller-supplied
+                // and a slice inside a character aborts the process.
+                let upto = &word[..crate::edit::boundary(word, e.cursor - start)];
                 out.caret = Some(Caret {
                     x: cursor_x + text.width(face, upto, px),
                     top: y,

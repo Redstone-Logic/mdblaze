@@ -63,6 +63,30 @@ pub struct Buffer {
     last_edit_at: u128,
 }
 
+/// The largest char boundary at or before `byte`.
+///
+/// Every offset that reaches a `&str` slice has to pass through this, because
+/// not all of them are trustworthy. A span's rendered text and its source are
+/// the same length for plain text and DIFFER wherever the parser resolved
+/// something -- `&hellip;` is eight source bytes and three rendered ones -- so a
+/// position derived by walking rendered characters can land a byte or two off.
+/// The README says as much: clicks near those constructs are approximate.
+///
+/// Approximate is survivable. Slicing a string inside a character is not: it
+/// panics, and this binary is built with `panic = "abort"`, so it is an instant
+/// process kill that takes unsaved edits with it. Found by clicking beside the
+/// emoji in `a &hellip; \u{1f389} b`.
+///
+/// Rounding DOWN rather than up, so the answer is never past the end of the
+/// string and never past what the caller asked for.
+pub fn boundary(s: &str, byte: usize) -> usize {
+    let mut i = byte.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 impl Buffer {
     pub fn from_str(text: &str) -> Self {
         // A trailing newline is a line terminator, not an empty last line: split
@@ -287,7 +311,7 @@ impl Buffer {
             let len = l.len();
             if byte <= len {
                 self.line = i;
-                self.col = l[..byte.min(len)].chars().count();
+                self.col = l[..boundary(l, byte)].chars().count();
                 return;
             }
             byte -= len + 1;
@@ -556,4 +580,47 @@ mod tests {
         }
         assert_eq!((b.line, b.col), (1, 2));
     }
+    // ---- char boundaries -----------------------------------------------
+
+    #[test]
+    fn a_position_inside_a_character_is_rounded_back_to_its_start() {
+        let s = "a \u{1f389} b";
+        // The emoji occupies bytes 2..6. Every offset inside it answers 2.
+        for i in 2..6 {
+            assert_eq!(boundary(s, i), 2, "offset {i}");
+        }
+        assert_eq!(boundary(s, 6), 6);
+    }
+
+    #[test]
+    fn a_position_past_the_end_is_the_end() {
+        let s = "abc";
+        assert_eq!(boundary(s, 99), 3);
+        assert_eq!(boundary("", 5), 0);
+    }
+
+    #[test]
+    fn positions_on_a_boundary_are_left_alone() {
+        let s = "a \u{1f389} b";
+        for i in [0, 1, 2, 6, 7, 8] {
+            assert_eq!(boundary(s, i), i);
+        }
+    }
+
+    #[test]
+    fn a_click_that_lands_inside_a_character_does_not_kill_the_program() {
+        // The real one. `&hellip;` is eight source bytes and three rendered
+        // ones, so a position walked through the rendered text lands two bytes
+        // into the emoji after it. Slicing there panics, and this binary is
+        // built with `panic = "abort"` -- an instant process kill, with the
+        // unsaved buffer in it.
+        let src = "a &hellip; \u{1f389} b\n";
+        let mut b = Buffer::from_str(src);
+        for at in 0..src.len() {
+            b.set_byte_offset(at);
+            // And the offset it settles on is always somewhere real.
+            assert!(src.is_char_boundary(b.byte_offset()), "left the caret inside a character");
+        }
+    }
+
 }

@@ -37,10 +37,15 @@ pub struct Bitmap {
 ///
 /// A compressed image declares its own dimensions, so a 40-kilobyte file may
 /// claim to be 60,000 by 60,000 and cost fourteen gigabytes to expand. That is a
-/// known trick and the defence is to refuse before allocating, not after. 64
-/// megapixels is four times a modern camera and far past anything a document
-/// puts on a page.
-const MAX_PIXELS: usize = 64 << 20;
+/// known trick and the defence is to refuse before allocating, not after.
+///
+/// 16 megapixels is twice a 4K screen and far past anything a document puts on
+/// a page. It is deliberately not larger, because the ceiling is a real
+/// allocation and not a notional one: the decoder wants four bytes a pixel and
+/// this crate keeps four more, so 16 megapixels already costs 128MB at the
+/// limit. Set at 64 it was half a gigabyte for one picture, in a program whose
+/// whole argument is that it is small.
+const MAX_PIXELS: usize = 16 << 20;
 
 impl Bitmap {
     /// A picture scaled to `nw` by `nh`, by averaging the source pixels that
@@ -68,10 +73,16 @@ impl Bitmap {
             for x in 0..nw {
                 let sx0 = x * self.w / nw;
                 let sx1 = (((x + 1) * self.w).div_ceil(nw)).max(sx0 + 1).min(self.w);
-                let (mut a, mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32, 0u32);
+                // 64-bit accumulators. A destination pixel can cover a very
+                // large number of source pixels when the reduction is extreme --
+                // a picture in a window dragged to its narrowest -- and 255
+                // times that overflows 32 bits. This binary is built with
+                // `panic = "abort"`, so in release an opaque white picture came
+                // back at alpha 0x35 and in debug the process died.
+                let (mut a, mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64, 0u64);
                 for sy in sy0..sy1 {
                     for sx in sx0..sx1 {
-                        let p = self.px[sy * self.w + sx];
+                        let p = u64::from(self.px[sy * self.w + sx]);
                         let pa = (p >> 24) & 0xff;
                         a += pa;
                         r += (((p >> 16) & 0xff) * pa) / 255;
@@ -86,8 +97,8 @@ impl Bitmap {
                 let (a, r, g, b) = (a / n, r / n, g / n, b / n);
                 // Back out of premultiplied space, so the renderer gets the
                 // colour the pixel would be if it were opaque.
-                let un = |c: u32| (c * 255).checked_div(a).unwrap_or(0).min(255);
-                px[y * nw + x] = (a << 24) | (un(r) << 16) | (un(g) << 8) | un(b);
+                let un = |c: u64| (c * 255).checked_div(a).unwrap_or(0).min(255) as u32;
+                px[y * nw + x] = ((a as u32) << 24) | (un(r) << 16) | (un(g) << 8) | un(b);
             }
         }
         Bitmap { w: nw, h: nh, px }
@@ -289,6 +300,23 @@ mod tests {
         let (w, h) = b.fit(1000.0, 200.0);
         assert!((h - 200.0).abs() < 0.01, "height not honoured: {w}x{h}");
         assert!(w < 21.0);
+    }
+
+    #[test]
+    fn an_extreme_reduction_does_not_wrap_the_accumulator() {
+        // 17.6 megapixels is the smallest source that reproduces it: the alpha
+        // accumulator sums 255 per pixel, and 16.8 million of those is where a
+        // 32-bit total wraps. In release, where this binary aborts rather than
+        // panics on overflow, an opaque white picture came back at alpha 0x35 --
+        // silently eighty percent transparent.
+        //
+        // Reachable through the public API, and through the program itself when
+        // a window is dragged narrow enough that a picture's box rounds to a
+        // pixel or two.
+        let n = 4200usize;
+        let b = Bitmap { w: n, h: n, px: vec![0xff_ffffff; n * n] };
+        let one = b.resized(1, 1);
+        assert_eq!(one.px[0], 0xff_ffffff, "an opaque white picture came back as {:#010x}", one.px[0]);
     }
 
     #[test]

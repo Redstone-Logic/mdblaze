@@ -158,21 +158,62 @@ fn blit(
 /// is exactly the identity wanted and it costs nothing to take.
 #[derive(Default)]
 pub struct Scaled {
-    at: std::collections::HashMap<(usize, usize, usize), std::rc::Rc<crate::pixels::Bitmap>>,
+    at: std::collections::HashMap<usize, Entry>,
+}
+
+/// One picture's scaled copy, and the source it came from.
+///
+/// The source `Rc` is held here rather than only borrowed, and that is what
+/// makes an ADDRESS a sound key: while this entry lives, the allocation it names
+/// cannot be freed, so the address cannot be handed to a different picture. Key
+/// on a raw pointer without holding the thing it points at and a freed-then-
+/// reallocated bitmap silently answers with somebody else's pixels.
+struct Entry {
+    source: std::rc::Rc<crate::pixels::Bitmap>,
+    w: usize,
+    h: usize,
+    scaled: std::rc::Rc<crate::pixels::Bitmap>,
 }
 
 impl Scaled {
-    fn get(&mut self, art: &std::rc::Rc<crate::pixels::Bitmap>, w: usize, h: usize) -> std::rc::Rc<crate::pixels::Bitmap> {
-        let key = (std::rc::Rc::as_ptr(art) as usize, w, h);
-        self.at
-            .entry(key)
-            .or_insert_with(|| std::rc::Rc::new(art.resized(w, h)))
-            .clone()
+    fn get(
+        &mut self,
+        art: &std::rc::Rc<crate::pixels::Bitmap>,
+        w: usize,
+        h: usize,
+    ) -> std::rc::Rc<crate::pixels::Bitmap> {
+        let key = std::rc::Rc::as_ptr(art) as usize;
+        // ONE entry per picture, replaced when the size changes -- not one per
+        // size ever seen.
+        //
+        // Keeping every size looks like a better cache and is a memory leak with
+        // a slow fuse: winit delivers a resize event per frame, so dragging a
+        // window edge once asks for a few hundred different widths and every one
+        // of them is kept for ever. Measured: 2.3MB at rest, 217MB after a
+        // single drag across a document with one screenshot in it, and it never
+        // came back down. A picture is only ever on screen at one size, so the
+        // other several hundred copies were unreachable the moment they were
+        // made.
+        if let Some(e) = self.at.get(&key) {
+            if e.w == w && e.h == h {
+                return e.scaled.clone();
+            }
+        }
+        let scaled = std::rc::Rc::new(art.resized(w, h));
+        self.at.insert(key, Entry { source: art.clone(), w, h, scaled: scaled.clone() });
+        scaled
     }
 
-    /// How many scaled copies are held. For a test to prove this is a cache.
+    /// How many pictures are held. For a test to prove this is a cache, and that
+    /// it is bounded by the document rather than by how long the window has been
+    /// dragged about.
     pub fn held(&self) -> usize {
         self.at.len()
+    }
+
+    /// The size the picture at `art` is currently held at, if any.
+    pub fn size_of(&self, art: &std::rc::Rc<crate::pixels::Bitmap>) -> Option<(usize, usize)> {
+        self.at.get(&(std::rc::Rc::as_ptr(art) as usize)).map(|e| (e.w, e.h))
     }
 }
 
@@ -524,11 +565,67 @@ mod tests {
         let (w, h) = (900usize, 600usize);
         let mut buf = vec![0u32; w * h];
         let mut scaled = Scaled::default();
+        let mut sizes = Vec::new();
         for width in [300.0, 500.0] {
             let laid = lay_out(&doc, width, 19.0, &text, None);
             draw(&laid, &mut text, &mut scaled, &mut buf, w, h, 0.0, &Theme::DARK);
+            sizes.push(laid.pictures[0].w.round() as usize);
         }
-        assert_eq!(scaled.held(), 2);
+        assert_ne!(sizes[0], sizes[1], "the test did not actually change the size");
+        let orange = buf.iter().filter(|p| **p == 0x00ff_8800).count();
+        assert!(orange > 1000, "nothing was drawn at the new size");
+    }
+
+    #[test]
+    fn dragging_a_window_edge_does_not_keep_every_size_it_passed_through() {
+        // The leak this replaced: winit delivers a resize per frame, so one drag
+        // asks for hundreds of widths. Keeping them all measured 217MB of
+        // resident memory after a single drag, none of it reachable, and it
+        // never came back down -- in a program whose whole claim is that closing
+        // it costs you nothing.
+        let mut text = Text::new();
+        // A small picture and a short drag: the assertion is about how many
+        // copies are kept, and a big one would only make the test slow.
+        let doc = doc_with_picture(240, 180, 0xff_ff8800);
+        let (w, h) = (700usize, 400usize);
+        let mut buf = vec![0u32; w * h];
+        let mut scaled = Scaled::default();
+        for width in 400..520 {
+            let laid = lay_out(&doc, width as f32, 19.0, &text, None);
+            draw(&laid, &mut text, &mut scaled, &mut buf, w, h, 0.0, &Theme::DARK);
+        }
+        assert_eq!(scaled.held(), 1, "one picture on screen, one copy kept");
+    }
+
+    #[test]
+    fn every_picture_in_a_document_is_kept_at_its_own_size() {
+        // The bound is the DOCUMENT, not one entry total: several pictures on a
+        // page must each keep their own scaled copy or they would evict each
+        // other and rescale on every frame.
+        let mut text = Text::new();
+        let mut doc = parse("![](a.png)\n\n![](b.png)\n\n![](c.png)\n");
+        let arts: Vec<_> = [(40, 30), (80, 60), (120, 90)]
+            .iter()
+            .map(|(w, h)| {
+                std::rc::Rc::new(crate::pixels::Bitmap { w: *w, h: *h, px: vec![0xff_ff8800; w * h] })
+            })
+            .collect();
+        let mut i = 0;
+        for b in &mut doc.blocks {
+            if let crate::doc::Kind::Image { art, .. } = &mut b.kind {
+                *art = crate::media::Art::Ready(arts[i].clone());
+                i += 1;
+            }
+        }
+        let laid = lay_out(&doc, 900.0, 19.0, &text, None);
+        let (w, h) = (900usize, 900usize);
+        let mut buf = vec![0u32; w * h];
+        let mut scaled = Scaled::default();
+        draw(&laid, &mut text, &mut scaled, &mut buf, w, h, 0.0, &Theme::DARK);
+        assert_eq!(scaled.held(), 3);
+        for a in &arts {
+            assert_eq!(scaled.size_of(a), Some((a.w, a.h)), "a picture was not kept at its own size");
+        }
     }
 
     #[test]
