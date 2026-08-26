@@ -39,6 +39,7 @@
 //! That is why the windowing lives behind its own edge and can be replaced
 //! without touching anything here; see the README for the measurements.
 
+pub mod clip;
 pub mod code;
 pub mod desktop;
 pub mod doc;

@@ -52,6 +52,20 @@ memmap2 = "0.9.11"
 # `xdg-portal` and not `gtk3`: linking GTK would pull in the toolkit this
 # program is built without.
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+# The system clipboard. `default-features = false` drops `image-data`, which
+# exists to put PICTURES on the clipboard and drags in the whole `image` crate
+# to do it -- this program copies text.
+#
+# `wayland-data-control` is the other half and is kept: without it the only
+# backend on Linux is X11, so on a Wayland session copy and paste would work
+# only where XWayland happens to be running and the compositor happens to bridge
+# the two clipboards. That is most desktops and not all of them, and "copy
+# silently did nothing" is the worst kind of bug to ship. It costs nothing on
+# macOS or Windows -- the dependency is gated to Linux inside arboard.
+#
+# Opened lazily, on the first copy or paste. Constructing it connects to the
+# display server and starts a thread; see `clip.rs`.
+arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
 
 # Windows only, and it costs the other platforms nothing: cargo does not build
 # or fetch it for a target it is not gated to. The registry is the only place

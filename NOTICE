@@ -43,8 +43,13 @@ Dependencies
 --------------------------------------------------------------------------------
 
 Every dependency is under a permissive licence -- MIT, Apache-2.0, BSD-2-Clause,
-BSD-3-Clause, ISC, Zlib, 0BSD, Unlicense or Unicode-3.0. There is no copyleft
-anywhere in the tree.
+BSD-3-Clause, ISC, Zlib, 0BSD, BSL-1.0, Unlicense or Unicode-3.0. There is no
+copyleft anywhere in the tree.
+
+BSL-1.0 is the Boost Software License, and it reaches the tree only on Windows,
+through the two crates that talk to the Windows clipboard (`clipboard-win` and
+`error-code`). It is permissive, and unusually it asks for NO notice at all when
+what is distributed is compiled object code.
 
 Cargo fetches each dependency with its own licence text, so a SOURCE
 distribution carries them already. A BINARY release does not, and the Apache-2.0
