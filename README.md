@@ -71,17 +71,19 @@ Arrows, Home, End, PageUp and PageDown do what they do everywhere.
 
 ### Opening a file
 
-<div align="center">
-<img src="docs/opening.png" width="720" alt="the file listing open over a document, with a directory highlighted and a path being typed below it">
-</div>
+`Ctrl+O` asks the system for a path, so you get the chooser you already know —
+Recent, your bookmarks, thumbnails, whatever your desktop provides. `Ctrl+S` on
+a buffer that has no filename asks the same way.
 
-Arrows and Enter, or type the path — Tab completes it the way a shell does.
-Directories come first, Enter goes into one, `..` goes back up. Save-as uses the
-same line, so a buffer you started from nothing has somewhere to go.
+Not a picker of our own. Typing a path is what `mdblaze notes.md` already does,
+and a second way to type a path serves nobody: the people who need a chooser are
+exactly the people who are not in a terminal.
 
-It is drawn with the same renderer as the document, not by a toolkit. A native
-dialog means a D-Bus round trip to a portal service that may not be running, and
-this whole program reaches first frame in the time that call takes to return.
+It runs on its own thread. On Linux that call is a D-Bus round trip to
+`xdg-desktop-portal`, which can be slow to activate or absent altogether — on the
+event loop it would freeze the window with no repaint and no Escape until it
+answered. Off the loop, the document stays live and the answer arrives when it
+arrives.
 
 ## It renders the markdown you actually write
 

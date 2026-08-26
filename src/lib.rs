@@ -48,6 +48,5 @@ pub mod file;
 pub mod layout;
 pub mod media;
 pub mod pixels;
-pub mod prompt;
 pub mod render;
 pub mod text;

@@ -37,8 +37,21 @@ use mdblaze::edit::Buffer;
 use mdblaze::file;
 use mdblaze::layout::{self, Editing, Laid};
 use mdblaze::media::Media;
-use mdblaze::prompt::{Intent, Prompt};
+
 use mdblaze::render::{self, Scaled, Theme};
+use winit::event_loop::EventLoopProxy;
+
+/// Which command asked for a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Intent {
+    Open,
+    SaveAs,
+}
+
+/// What the chooser thread sends back: the intent it was asked for, and the
+/// path, or `None` if the person cancelled or no chooser could be reached.
+#[derive(Debug)]
+struct Chosen(Intent, Option<std::path::PathBuf>);
 use mdblaze::text::Text;
 
 use winit::application::ApplicationHandler;
@@ -81,10 +94,13 @@ struct App {
     /// is reparsed on every keystroke and decoding a screenshot is milliseconds;
     /// without this, typing beside a picture would be visibly slow.
     media: Media,
-    /// The path being typed, when a path is being typed. `None` costs nothing:
-    /// no directory is read and no widget exists until Ctrl+O or a save with no
-    /// filename asks for one.
-    prompt: Option<Prompt>,
+    /// A file chooser is open, and the answer will arrive on the event loop.
+    ///
+    /// Tracked so a second Ctrl+O does not stack dialogs, and so the status line
+    /// can say what the window is waiting for.
+    choosing: Option<Intent>,
+    /// How the chooser thread hands its answer back.
+    proxy: EventLoopProxy<Chosen>,
     /// Pictures at the size they are on screen. Rebuilding them every frame cost
     /// fifteen milliseconds a keystroke; see [`Scaled`].
     scaled: Scaled,
@@ -135,28 +151,53 @@ impl App {
         self.laid_for = width;
     }
 
-    /// Where a path prompt should start from: beside the open document, or the
-    /// working directory when there is none.
-    fn near(&self) -> String {
-        let dir = self
+    /// Ask the system for a path, without blocking the window.
+    ///
+    /// On its own thread, always. `rfd`'s call is synchronous, and on Linux it
+    /// is a D-Bus round trip to `xdg-desktop-portal` -- a service that may be
+    /// slow to activate, or absent. Called on the event loop that would freeze
+    /// the editor: no repaint, no Escape, nothing, until it answered. Measured
+    /// on this machine, it never answered at all.
+    ///
+    /// So the loop keeps running, the status line says what it is waiting for,
+    /// and the answer arrives later as an event.
+    fn ask(&mut self, intent: Intent) {
+        if self.choosing.is_some() {
+            return;
+        }
+        self.choosing = Some(intent);
+        self.say(match intent {
+            Intent::Open => "choosing a file…",
+            Intent::SaveAs => "choosing where to save…",
+        });
+
+        let start = self
             .path
             .as_ref()
             .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default();
-        let mut s = dir.to_string_lossy().to_string();
-        // The platform's own separator, so a seeded path looks native on
-        // Windows rather than mixing the two.
-        if !s.chars().next_back().is_some_and(std::path::is_separator) {
-            s.push(std::path::MAIN_SEPARATOR);
-        }
-        s
-    }
+        let name = self
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "untitled.md".into());
+        let proxy = self.proxy.clone();
 
-    fn ask(&mut self, intent: Intent) {
-        let start = self.near();
-        self.prompt = Some(Prompt::new(intent, &start));
-        self.note = None;
+        std::thread::spawn(move || {
+            let d = rfd::FileDialog::new()
+                .set_directory(&start)
+                .add_filter("Markdown", &["md", "markdown"])
+                .add_filter("All files", &["*"]);
+            let picked = match intent {
+                Intent::Open => d.pick_file(),
+                Intent::SaveAs => d.set_file_name(name).save_file(),
+            };
+            // If the loop is already gone the send fails, which is fine: there
+            // is nothing left to tell.
+            let _ = proxy.send_event(Chosen(intent, picked));
+        });
     }
 
     /// Open `path`, replacing what is on screen.
@@ -173,6 +214,7 @@ impl App {
                 self.path = Some(path);
                 self.scroll = 0.0;
                 self.armed_at = None;
+                self.note = None;
                 self.reflow(width);
                 if let Some(w) = &self.window {
                     w.set_title(&self.title());
@@ -180,28 +222,6 @@ impl App {
             }
             Err(e) => self.say(&format!("could not open: {e}")),
         }
-    }
-
-    /// Act on a confirmed prompt. Returns true if anything changed on screen.
-    fn confirm(&mut self, width: f32) -> bool {
-        let Some(p) = self.prompt.take() else { return false };
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
-        let path = p.path(&home);
-        if path.as_os_str().is_empty() {
-            return true;
-        }
-        match p.intent {
-            Intent::Open => self.open(path, width),
-            Intent::SaveAs => {
-                self.path = Some(path);
-                self.media = Media::for_document(self.path.as_deref());
-                self.save();
-                if let Some(w) = &self.window {
-                    w.set_title(&self.title());
-                }
-            }
-        }
-        true
     }
 
     fn ms(&self) -> u128 {
@@ -287,7 +307,38 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<Chosen> for App {
+    /// The chooser answered. This is the only place a path arrives from it.
+    fn user_event(&mut self, _el: &ActiveEventLoop, Chosen(intent, path): Chosen) {
+        self.choosing = None;
+        let width = self
+            .window
+            .as_ref()
+            .map(|w| w.inner_size().width as f32)
+            .unwrap_or(self.laid_for);
+        let Some(path) = path else {
+            self.say("nothing chosen");
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+            return;
+        };
+        match intent {
+            Intent::Open => self.open(path, width),
+            Intent::SaveAs => {
+                self.path = Some(path);
+                self.media = Media::for_document(self.path.as_deref());
+                self.save();
+                if let Some(w) = &self.window {
+                    w.set_title(&self.title());
+                }
+            }
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
     fn resumed(&mut self, el: &ActiveEventLoop) {
         let attrs = Window::default_attributes()
             .with_title(self.title())
@@ -356,106 +407,6 @@ impl ApplicationHandler for App {
                 // rendering differs, because a block reveals and hides with the
                 // caret.
                 let mut touched = true;
-
-                // A prompt takes the keyboard while it is up. Every branch
-                // below assumes it is editing the DOCUMENT, and letting a
-                // filename fall through to that would type it into the file.
-                if self.prompt.is_some() {
-                    let w = size.width as f32;
-                    let home =
-                        std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
-                    match &event.logical_key {
-                        Key::Named(NamedKey::Escape) => self.prompt = None,
-                        Key::Named(NamedKey::Enter) => {
-                            // Enter takes the highlighted entry when there is
-                            // one, so the whole thing works with arrows alone.
-                            // A directory descends instead of opening, because
-                            // opening a directory is not a thing.
-                            let saving = self.prompt.as_ref().map(|p| p.intent) == Some(Intent::SaveAs);
-                            let picked = self.prompt.as_mut().and_then(|p| {
-                                let e = p.entries(&home);
-                                // While saving, only a DIRECTORY is worth
-                                // taking from the list: the file being named
-                                // does not exist yet, so the typed text is the
-                                // answer.
-                                e.get(p.selected).filter(|e| !saving || e.is_dir).cloned()
-                            });
-                            match picked {
-                                Some(e) if e.is_dir => {
-                                    if let Some(p) = self.prompt.as_mut() {
-                                        p.take(&e, &home);
-                                    }
-                                }
-                                Some(e) => {
-                                    if let Some(p) = self.prompt.as_mut() {
-                                        p.take(&e, &home);
-                                    }
-                                    self.confirm(w);
-                                }
-                                None => {
-                                    self.confirm(w);
-                                }
-                            }
-                        }
-                        Key::Named(NamedKey::ArrowDown) => {
-                            if let Some(p) = self.prompt.as_mut() {
-                                let n = p.entries(&home).len();
-                                p.move_by(1, n);
-                            }
-                        }
-                        Key::Named(NamedKey::ArrowUp) => {
-                            if let Some(p) = self.prompt.as_mut() {
-                                let n = p.entries(&home).len();
-                                p.move_by(-1, n);
-                            }
-                        }
-                        Key::Named(NamedKey::Tab) => {
-                            if let Some(p) = self.prompt.as_mut() {
-                                p.complete(&home);
-                            }
-                        }
-                        Key::Named(NamedKey::Backspace) => {
-                            if let Some(p) = self.prompt.as_mut() {
-                                p.backspace();
-                            }
-                        }
-                        Key::Named(NamedKey::Space) => {
-                            if let Some(p) = self.prompt.as_mut() {
-                                p.insert(' ');
-                            }
-                        }
-                        Key::Named(NamedKey::ArrowLeft) => {
-                            if let Some(p) = self.prompt.as_mut() {
-                                p.left();
-                            }
-                        }
-                        Key::Named(NamedKey::ArrowRight) => {
-                            if let Some(p) = self.prompt.as_mut() {
-                                p.right();
-                            }
-                        }
-                        Key::Named(NamedKey::Home) => {
-                            if let Some(p) = self.prompt.as_mut() {
-                                p.home();
-                            }
-                        }
-                        Key::Named(NamedKey::End) => {
-                            if let Some(p) = self.prompt.as_mut() {
-                                p.end();
-                            }
-                        }
-                        Key::Character(c) if !ctrl => {
-                            if let Some(p) = self.prompt.as_mut() {
-                                for ch in c.chars() {
-                                    p.insert(ch);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                    window.request_redraw();
-                    return;
-                }
 
                 match &event.logical_key {
                     Key::Character(c) if ctrl && c.eq_ignore_ascii_case("o") => {
@@ -610,19 +561,6 @@ impl ApplicationHandler for App {
                 let note = self.note.as_ref().map(|(t, _)| t.clone());
                 let scroll = self.scroll;
 
-                let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
-                let showing = self.prompt.as_mut().map(|p| {
-                    let entries = p.entries(&home);
-                    (
-                        p.intent.label(),
-                        p.text().to_string(),
-                        p.caret_chars(),
-                        p.note.clone(),
-                        entries,
-                        p.selected,
-                        p.top,
-                    )
-                });
                 let surface = self.surface.as_mut().expect("surface");
                 surface.resize(w, h).expect("resize");
                 let mut buf = surface.buffer_mut().expect("buffer");
@@ -630,16 +568,10 @@ impl ApplicationHandler for App {
                     &self.laid, &mut self.text, &mut self.scaled, &mut buf, width, height,
                     scroll, &Theme::DARK,
                 );
-                match &showing {
-                    Some((label, typed, caret, note, entries, sel, top)) => render::draw_prompt(
-                        &mut self.text, &mut buf, width, height, BASE, &Theme::DARK,
-                        label, typed, *caret, note.as_deref(), entries, *sel, *top,
-                    ),
-                    None => render::draw_status(
-                        &mut self.text, &mut buf, width, height, BASE, &Theme::DARK, &name, dirty,
-                        note.as_deref(), armed,
-                    ),
-                }
+                render::draw_status(
+                    &mut self.text, &mut buf, width, height, BASE, &Theme::DARK, &name, dirty,
+                    note.as_deref(), armed,
+                );
                 buf.present().expect("present");
 
                 if self.timing && !self.reported {
@@ -798,7 +730,11 @@ fn main() {
     // program's own work and is measured in fractions of a millisecond; almost
     // all of what a person waits for is below it, in the toolkit.
     let t_el = Instant::now();
-    let el = EventLoop::new().expect("no event loop");
+    // A loop that can carry our own events, so the file chooser -- which runs
+    // on its own thread and may take a long time or never answer -- can hand its
+    // result back without the window having waited for it.
+    let el = EventLoop::<Chosen>::with_user_event().build().expect("no event loop");
+    let proxy = el.create_proxy();
     if timing {
         eprintln!("event loop: {:.2} ms", t_el.elapsed().as_secs_f64() * 1000.0);
     }
@@ -810,7 +746,8 @@ fn main() {
         buffer,
         text,
         media,
-        prompt: None,
+        choosing: None,
+        proxy,
         scaled: Scaled::default(),
         laid,
         laid_for: 900.0,
@@ -827,7 +764,7 @@ fn main() {
 
     if once {
         struct Once<'a>(&'a mut App);
-        impl ApplicationHandler for Once<'_> {
+        impl ApplicationHandler<Chosen> for Once<'_> {
             fn resumed(&mut self, el: &ActiveEventLoop) {
                 self.0.resumed(el);
                 if let Some(w) = self.0.window.clone() {

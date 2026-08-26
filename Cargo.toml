@@ -43,6 +43,15 @@ ttf-parser = { version = "0.25.1", default-features = false, features = ["std"] 
 png = { version = "0.18.1", default-features = false }
 zune-jpeg = { version = "0.5.15", default-features = false, features = ["std"] }
 memmap2 = "0.9.11"
+# The system's own file chooser. Two crates on Linux, where it speaks to
+# xdg-desktop-portal over D-Bus rather than linking GTK; native panels on macOS
+# and Windows. Chosen over a picker of our own because typing a path is what
+# `mdblaze notes.md` already does -- a second way to type a path serves nobody,
+# and the people who need a chooser are exactly the ones not in a terminal.
+#
+# `xdg-portal` and not `gtk3`: linking GTK would pull in the toolkit this
+# program is built without.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 
 # Windows only, and it costs the other platforms nothing: cargo does not build
 # or fetch it for a target it is not gated to. The registry is the only place
