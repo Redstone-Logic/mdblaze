@@ -36,6 +36,7 @@
 
 use crate::code::{self, Tok};
 use crate::doc::{Doc, Kind, Span, Style};
+use crate::media::Art;
 use crate::text::{Face, Text, CODE_LEADING};
 
 /// Longest a line of prose may get, in pixels.
@@ -110,6 +111,17 @@ pub struct Shape {
     pub ink: Ink,
 }
 
+/// A picture, placed. The pixels are shared with the document rather than copied
+/// into the layout, which is laid out again on every keystroke.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Picture {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub art: std::rc::Rc<crate::pixels::Bitmap>,
+}
+
 /// What the caller needs to know to draw a caret: where, and how tall.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Caret {
@@ -123,6 +135,7 @@ pub struct Caret {
 pub struct Laid {
     pub runs: Vec<Run>,
     pub shapes: Vec<Shape>,
+    pub pictures: Vec<Picture>,
     /// Total height, so the caller knows how far it can scroll.
     pub height: f32,
     /// Where the insertion point landed, when editing.
@@ -335,6 +348,9 @@ pub fn lay_out(
             Kind::Rule => {
                 out.shapes.push(Shape { x: x0, y, w: avail, h: 1.0, ink: Ink::Dim });
                 y += base * 0.6;
+            }
+            Kind::Image { url, alt, art } => {
+                y = lay_picture(&mut out, text, block, url, alt, art, x0, y, content - indent, base);
             }
             // A mermaid fence is a DIAGRAM, not code. Rendered to box-drawing
             // text, which this program already knows how to draw -- the SVG
@@ -620,6 +636,99 @@ impl Laid {
         Some(last.source + last.text.len())
     }
 }
+
+/// Lay one picture out, and answer the y it ends at.
+///
+/// A picture is placed at the shared left edge like every other block, sized
+/// down to fit the column and never up -- see [`crate::pixels::Bitmap::fit`].
+///
+/// When there is no picture the space is not left blank. A gap where a figure
+/// should be tells the reader nothing; the alt text and the reason tell them
+/// what was meant and why it is not there, which is the difference between a
+/// document that is missing something and a program that is broken.
+#[allow(clippy::too_many_arguments)]
+fn lay_picture(
+    out: &mut Laid,
+    text: &Text,
+    block: &crate::doc::Block,
+    url: &str,
+    alt: &str,
+    art: &Art,
+    x0: f32,
+    y: f32,
+    avail: f32,
+    base: f32,
+) -> f32 {
+    match art {
+        Art::Ready(bitmap) => {
+            let (w, h) = bitmap.fit(avail.max(1.0), base * MAX_PICTURE_EMS);
+            out.pictures.push(Picture { x: x0, y, w, h, art: bitmap.clone() });
+            // An anchor with nothing in it, at the picture's middle.
+            //
+            // `hit` answers in RUNS, so without one of these a click anywhere on
+            // a picture lands on the paragraph above or below it and there is no
+            // way to reach the image's own source to correct a path. It draws
+            // nothing: a run with no characters has no glyphs.
+            out.runs.push(Run {
+                x: x0,
+                baseline: y + h / 2.0,
+                text: String::new(),
+                face: Face::Sans,
+                px: base,
+                ink: Ink::Dim,
+                italic: false,
+                source: block.source.start,
+            });
+            y + h
+        }
+        Art::Missing(why) => {
+            let px = base * 0.92;
+            let face = Face::SansItalic;
+            let lh = text.line_height(face, px);
+            let name = if alt.trim().is_empty() { url } else { alt };
+            out.runs.push(Run {
+                x: x0,
+                baseline: y + text.ascent(face, px),
+                text: format!("[{}] \u{2014} {}", name.trim(), why.reason()),
+                face,
+                px,
+                ink: Ink::Dim,
+                italic: true,
+                source: block.source.start,
+            });
+            y + lh
+        }
+        // Laid out before `media` was given the chance to look. Not a state the
+        // program reaches -- the binary attaches media to every document it
+        // parses -- but a test that lays out a document without a filesystem
+        // does, and it should see the alt text rather than nothing.
+        Art::Unresolved => {
+            let px = base * 0.92;
+            let face = Face::SansItalic;
+            let lh = text.line_height(face, px);
+            let name = if alt.trim().is_empty() { url } else { alt };
+            out.runs.push(Run {
+                x: x0,
+                baseline: y + text.ascent(face, px),
+                text: format!("[{}]", name.trim()),
+                face,
+                px,
+                ink: Ink::Dim,
+                italic: true,
+                source: block.source.start,
+            });
+            y + lh
+        }
+    }
+}
+
+/// The tallest a picture is drawn, in multiples of the type size.
+///
+/// A screenshot of a whole screen is taller than it is wide; sized only by the
+/// column it would push everything after it a page and a half down, and the
+/// reader would have to scroll past a picture to find out whether the document
+/// continues. Twenty-six ems is about two thirds of a window.
+const MAX_PICTURE_EMS: f32 = 26.0;
 
 /// Lay a run of table rows out as a table.
 ///
@@ -1502,4 +1611,147 @@ mod tests {
         assert_eq!(words("a b  c"), vec!["a ", "b  ", "c"]);
         assert_eq!(words(""), Vec::<&str>::new());
     }
+    // ---- pictures ------------------------------------------------------
+
+    fn stub(w: usize, h: usize) -> std::rc::Rc<crate::pixels::Bitmap> {
+        std::rc::Rc::new(crate::pixels::Bitmap { w, h, px: vec![0xff_ff8800; w * h] })
+    }
+
+    /// A document with one picture in it, already resolved -- so a layout test
+    /// needs no filesystem and no decoder.
+    fn with_picture(src: &str, art: Art) -> Doc {
+        let mut doc = parse(src);
+        for b in &mut doc.blocks {
+            if let Kind::Image { art: a, .. } = &mut b.kind {
+                *a = art.clone();
+            }
+        }
+        doc
+    }
+
+    #[test]
+    fn a_picture_is_sized_to_the_column_and_never_larger() {
+        let text = Text::new();
+        let doc = with_picture("![](big.png)\n", Art::Ready(stub(4000, 2000)));
+        let laid = lay_out(&doc, 900.0, 19.0, &text, None);
+        let p = laid.pictures.first().expect("a picture was laid out");
+        assert!(p.w <= 900.0 - PAD * 2.0, "wider than the page: {}", p.w);
+        assert!((p.w / p.h - 2.0).abs() < 0.01, "proportions lost: {}x{}", p.w, p.h);
+    }
+
+    #[test]
+    fn a_small_picture_is_left_at_its_own_size() {
+        // A 32-pixel icon blown up to the width of the column is a blurred
+        // rectangle, and it is not what the author wrote.
+        let text = Text::new();
+        let doc = with_picture("![](icon.png)\n", Art::Ready(stub(32, 32)));
+        let laid = lay_out(&doc, 900.0, 19.0, &text, None);
+        let p = laid.pictures.first().expect("picture");
+        assert_eq!((p.w, p.h), (32.0, 32.0));
+    }
+
+    #[test]
+    fn a_very_tall_picture_is_capped_so_the_document_still_continues() {
+        // Sized only by the column, a full-screen portrait screenshot pushes
+        // everything after it a page and a half down and the reader has to
+        // scroll past a picture to learn whether there is any more document.
+        let text = Text::new();
+        let doc = with_picture("![](tall.png)\n", Art::Ready(stub(400, 8000)));
+        let laid = lay_out(&doc, 900.0, 19.0, &text, None);
+        let p = laid.pictures.first().expect("picture");
+        assert!(p.h <= 19.0 * 26.0 + 0.01, "not capped: {}", p.h);
+    }
+
+    #[test]
+    fn a_picture_starts_at_the_same_left_edge_as_the_prose() {
+        // One content column. A page whose left edge moves from block to block
+        // reads as a fault however defensible each width is on its own.
+        let text = Text::new();
+        let doc = with_picture("Some prose.\n\n![](p.png)\n", Art::Ready(stub(200, 100)));
+        let laid = lay_out(&doc, 900.0, 19.0, &text, None);
+        let prose_x = laid.runs.iter().find(|r| r.text.contains("Some")).expect("prose").x;
+        assert!((laid.pictures[0].x - prose_x).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_picture_takes_up_the_room_it_is_drawn_in() {
+        // If the layout advanced by less than the picture's height, everything
+        // after it would be drawn on top of it.
+        let text = Text::new();
+        let doc = with_picture("![](p.png)\n\nAfter.\n", Art::Ready(stub(200, 400)));
+        let laid = lay_out(&doc, 900.0, 19.0, &text, None);
+        let p = &laid.pictures[0];
+        let after = laid.runs.iter().find(|r| r.text.contains("After")).expect("prose after");
+        assert!(after.baseline > p.y + p.h, "the paragraph after landed on the picture");
+    }
+
+    #[test]
+    fn a_missing_picture_says_what_was_meant_and_why_it_is_not_there() {
+        // A gap where a figure should be tells the reader nothing.
+        let text = Text::new();
+        let doc = with_picture(
+            "![the architecture](arch.png)\n",
+            Art::Missing(crate::media::Missing::NotFound),
+        );
+        let laid = lay_out(&doc, 900.0, 19.0, &text, None);
+        let line: String = laid.runs.iter().map(|r| r.text.as_str()).collect();
+        assert!(line.contains("the architecture"), "{line:?}");
+        assert!(line.contains("no such file"), "{line:?}");
+        assert!(laid.pictures.is_empty());
+    }
+
+    #[test]
+    fn a_refused_remote_picture_says_it_was_refused_rather_than_broken() {
+        let text = Text::new();
+        let doc = with_picture("![](https://x/y.png)\n", Art::Missing(crate::media::Missing::Remote));
+        let laid = lay_out(&doc, 900.0, 19.0, &text, None);
+        let line: String = laid.runs.iter().map(|r| r.text.as_str()).collect();
+        assert!(line.contains("network"), "{line:?}");
+    }
+
+    #[test]
+    fn a_picture_with_no_alt_text_names_the_file_instead() {
+        let text = Text::new();
+        let doc = with_picture("![](diagrams/flow.png)\n", Art::Missing(crate::media::Missing::NotFound));
+        let laid = lay_out(&doc, 900.0, 19.0, &text, None);
+        let line: String = laid.runs.iter().map(|r| r.text.as_str()).collect();
+        assert!(line.contains("diagrams/flow.png"), "{line:?}");
+    }
+
+    #[test]
+    fn clicking_a_picture_reaches_its_source_so_a_wrong_path_can_be_corrected() {
+        // Without an anchor run the click lands on the paragraph above or below
+        // and there is no way to put the caret in the image's own markdown.
+        let text = Text::new();
+        let src = "Before.\n\n![alt](p.png)\n\nAfter.\n";
+        let doc = with_picture(src, Art::Ready(stub(300, 200)));
+        let laid = lay_out(&doc, 900.0, 19.0, &text, None);
+        let p = &laid.pictures[0];
+        let at = laid.hit(p.x + p.w / 2.0, p.y + p.h / 2.0, &text).expect("a hit");
+        assert!(src[at..].starts_with("!["), "landed at {at}: {:?}", &src[at..at + 6.min(src.len() - at)]);
+    }
+
+    #[test]
+    fn an_anchor_draws_nothing() {
+        // It exists to be hit, not to be seen. A run with characters in it would
+        // put stray text where the picture is.
+        let text = Text::new();
+        let doc = with_picture("![alt](p.png)\n", Art::Ready(stub(300, 200)));
+        let laid = lay_out(&doc, 900.0, 19.0, &text, None);
+        assert!(laid.runs.iter().all(|r| r.text.is_empty()));
+    }
+
+    #[test]
+    fn the_caret_in_a_picture_shows_its_markdown() {
+        // Live editing: the block under the caret reveals its source. An image
+        // is where that matters most -- it is how a path gets corrected.
+        let text = Text::new();
+        let src = "![alt](p.png)\n";
+        let doc = with_picture(src, Art::Ready(stub(300, 200)));
+        let laid = lay_out(&doc, 900.0, 19.0, &text, Some(Editing { source: src, cursor: 3 }));
+        let shown: String = laid.runs.iter().map(|r| r.text.as_str()).collect();
+        assert!(shown.contains("![alt](p.png)"), "{shown:?}");
+        assert!(laid.pictures.is_empty(), "the picture is still drawn under its own source");
+    }
+
 }

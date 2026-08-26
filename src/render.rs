@@ -9,8 +9,8 @@
 //! before any glyph is touched, so scrolling a long document costs the same as
 //! scrolling a short one.
 
-use crate::layout::{Ink, Laid, PAD};
-use crate::text::{Face, Text, SHEAR};
+use crate::layout::{Ink, Laid, Picture, PAD};
+use crate::text::{Face, Glyph, Pixels, Text, SHEAR};
 
 /// Colours, as `0x00RRGGBB` to match softbuffer's format.
 #[derive(Debug, Clone, Copy)]
@@ -93,10 +93,133 @@ fn blend(bg: u32, fg: u32, a: u8) -> u32 {
     (mix(16) << 16) | (mix(8) << 8) | mix(0)
 }
 
+/// Put one glyph's pixels into the buffer at `gx`, `gy` -- the top-left of its
+/// bitmap, in buffer coordinates.
+///
+/// One function for both kinds of glyph. A coverage mask is painted in
+/// `colour`; a colour glyph carries its own and `colour` is not used, because
+/// there is no meaningful way to tint a picture of a rocket.
+///
+/// `shear` leans each row by its distance above the bottom of the glyph, for a
+/// synthetic italic. It is zero everywhere now that a real italic face is
+/// compiled in, and the parameter stays because a face without one would want
+/// it back rather than losing emphasis.
+#[allow(clippy::too_many_arguments)]
+fn blit(
+    buf: &mut [u32],
+    width: usize,
+    height: usize,
+    g: &Glyph,
+    gx: f32,
+    gy: f32,
+    colour: u32,
+    shear: f32,
+) {
+    for row in 0..g.height {
+        let py = gy.round() as i64 + row as i64;
+        if py < 0 || py >= height as i64 {
+            continue;
+        }
+        let lean = if shear == 0.0 { 0.0 } else { (g.height as f32 - row as f32) * shear };
+        let base = py as usize * width;
+        for col in 0..g.width {
+            let (fg, a) = match &g.pixels {
+                Pixels::Mask(m) => (colour, m[row * g.width + col]),
+                Pixels::Colour(c) => {
+                    let p = c[row * g.width + col];
+                    (p & 0x00ff_ffff, ((p >> 24) & 0xff) as u8)
+                }
+            };
+            if a == 0 {
+                continue;
+            }
+            let px = (gx + lean).round() as i64 + col as i64;
+            if px < 0 || px >= width as i64 {
+                continue;
+            }
+            let i = base + px as usize;
+            buf[i] = blend(buf[i], fg, a);
+        }
+    }
+}
+
+/// Pictures at the size they are being drawn, kept between frames.
+///
+/// Not an optimisation to be tidied away later. Scaling is where the work in a
+/// picture is -- a full-window screenshot down to the column is a million source
+/// pixels averaged -- and it happens once per FRAME, which is once per keystroke
+/// and once per scroll step. Measured at 15.5ms a frame against 0.4ms for the
+/// same page without a picture on it. Typing beside a screenshot was visibly
+/// behind the keyboard.
+///
+/// The size only changes when the window does, so almost every frame is a hit.
+/// Keyed on which picture and what size, and the picture is identified by its
+/// address -- the same decoded bytes are shared by every use of one URL, so this
+/// is exactly the identity wanted and it costs nothing to take.
+#[derive(Default)]
+pub struct Scaled {
+    at: std::collections::HashMap<(usize, usize, usize), std::rc::Rc<crate::pixels::Bitmap>>,
+}
+
+impl Scaled {
+    fn get(&mut self, art: &std::rc::Rc<crate::pixels::Bitmap>, w: usize, h: usize) -> std::rc::Rc<crate::pixels::Bitmap> {
+        let key = (std::rc::Rc::as_ptr(art) as usize, w, h);
+        self.at
+            .entry(key)
+            .or_insert_with(|| std::rc::Rc::new(art.resized(w, h)))
+            .clone()
+    }
+
+    /// How many scaled copies are held. For a test to prove this is a cache.
+    pub fn held(&self) -> usize {
+        self.at.len()
+    }
+}
+
+/// Draw a picture into the buffer, scaled to the box the layout gave it.
+///
+/// Scaled at draw time rather than at load time because the box depends on the
+/// window's width, which changes; the decoded picture does not, and is shared.
+fn draw_picture(
+    buf: &mut [u32],
+    width: usize,
+    height: usize,
+    p: &Picture,
+    scroll: f32,
+    scaled: &mut Scaled,
+) {
+    let (w, h) = (p.w.round().max(1.0) as usize, p.h.round().max(1.0) as usize);
+    let small = scaled.get(&p.art, w, h);
+    let x0 = p.x.round() as i64;
+    let y0 = (p.y - scroll).round() as i64;
+    for row in 0..h {
+        let py = y0 + row as i64;
+        if py < 0 || py >= height as i64 {
+            continue;
+        }
+        let base = py as usize * width;
+        for col in 0..w {
+            let px = x0 + col as i64;
+            if px < 0 || px >= width as i64 {
+                continue;
+            }
+            let p = small.px[row * w + col];
+            let a = ((p >> 24) & 0xff) as u8;
+            if a == 0 {
+                continue;
+            }
+            let i = base + px as usize;
+            buf[i] = blend(buf[i], p & 0x00ff_ffff, a);
+        }
+    }
+}
+
 /// Draw `laid` into `buf`, scrolled down by `scroll` pixels.
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     laid: &Laid,
     text: &mut Text,
+    scaled: &mut Scaled,
     buf: &mut [u32],
     width: usize,
     height: usize,
@@ -121,6 +244,17 @@ pub fn draw(
                 buf[row + x as usize] = colour;
             }
         }
+    }
+
+    // Pictures next: they sit on the grounds and under nothing.
+    for p in &laid.pictures {
+        let top = p.y - scroll;
+        // Skipped before the picture is scaled, which is the expensive half. A
+        // document of screenshots scrolls as fast as one of prose.
+        if top + p.h < 0.0 || top > height as f32 {
+            continue;
+        }
+        draw_picture(buf, width, height, p, scroll, scaled);
     }
 
     // Before the text, so a caret sitting on a glyph does not cover it.
@@ -150,33 +284,8 @@ pub fn draw(
             // every glyph a line away from where it belongs.
             let gx = pen + g.left;
             let gy = baseline + g.top;
-
-            for row in 0..g.height {
-                let py = gy.round() as i64 + row as i64;
-                if py < 0 || py >= height as i64 {
-                    continue;
-                }
-                // Synthetic italics: shift each row by its distance above the
-                // baseline. The top of a tall glyph leans furthest.
-                let lean = if run.italic {
-                    (g.height as f32 - row as f32) * SHEAR
-                } else {
-                    0.0
-                };
-                let base = py as usize * width;
-                for col in 0..g.width {
-                    let cov = g.bitmap[row * g.width + col];
-                    if cov == 0 {
-                        continue;
-                    }
-                    let px = (gx + lean).round() as i64 + col as i64;
-                    if px < 0 || px >= width as i64 {
-                        continue;
-                    }
-                    let i = base + px as usize;
-                    buf[i] = blend(buf[i], colour, cov);
-                }
-            }
+            let shear = if run.italic { SHEAR } else { 0.0 };
+            blit(buf, width, height, g, gx, gy, colour, shear);
             pen += advance;
         }
     }
@@ -192,7 +301,7 @@ mod tests {
         let mut text = Text::new();
         let laid = lay_out(&parse(src), w as f32, 16.0, &text, None);
         let mut buf = vec![0u32; w * h];
-        draw(&laid, &mut text, &mut buf, w, h, scroll, &Theme::DARK);
+        draw(&laid, &mut text, &mut Scaled::default(), &mut buf, w, h, scroll, &Theme::DARK);
         buf
     }
 
@@ -252,7 +361,7 @@ mod tests {
         );
         assert!(laid.caret.is_some(), "the layout produced no caret to draw");
         let mut buf = vec![0u32; w * h];
-        draw(&laid, &mut text, &mut buf, w, h, 0.0, &Theme::DARK);
+        draw(&laid, &mut text, &mut Scaled::default(), &mut buf, w, h, 0.0, &Theme::DARK);
         assert!(
             buf.iter().any(|p| *p == Theme::DARK.caret),
             "the caret was never painted"
@@ -351,6 +460,106 @@ mod tests {
         let plain = l.runs.iter().find(|r| r.text.trim() == "plain").expect("plain");
         assert_eq!(plain.face, crate::text::Face::Sans);
     }
+
+    // ---- pictures and colour glyphs ------------------------------------
+
+    fn doc_with_picture(w: usize, h: usize, colour: u32) -> crate::doc::Doc {
+        let mut doc = parse("![](p.png)\n");
+        let art = std::rc::Rc::new(crate::pixels::Bitmap { w, h, px: vec![colour; w * h] });
+        for b in &mut doc.blocks {
+            if let crate::doc::Kind::Image { art: a, .. } = &mut b.kind {
+                *a = crate::media::Art::Ready(art.clone());
+            }
+        }
+        doc
+    }
+
+    #[test]
+    fn a_picture_puts_its_own_colours_on_the_page() {
+        let mut text = Text::new();
+        let doc = doc_with_picture(200, 100, 0xff_ff8800);
+        let laid = lay_out(&doc, 400.0, 16.0, &text, None);
+        let (w, h) = (400usize, 400usize);
+        let mut buf = vec![0u32; w * h];
+        draw(&laid, &mut text, &mut Scaled::default(), &mut buf, w, h, 0.0, &Theme::DARK);
+        let orange = buf.iter().filter(|p| **p == 0x00ff_8800).count();
+        assert!(orange > 10_000, "the picture is not on the page: {orange} pixels");
+    }
+
+    #[test]
+    fn a_transparent_picture_lets_the_page_through() {
+        // Otherwise every icon with a transparent border arrives in a black box.
+        let mut text = Text::new();
+        let doc = doc_with_picture(100, 100, 0x00_ff0000);
+        let laid = lay_out(&doc, 400.0, 16.0, &text, None);
+        let (w, h) = (400usize, 400usize);
+        let mut buf = vec![0u32; w * h];
+        draw(&laid, &mut text, &mut Scaled::default(), &mut buf, w, h, 0.0, &Theme::DARK);
+        assert!(buf.iter().all(|p| *p == Theme::DARK.bg), "a fully transparent picture painted something");
+    }
+
+    #[test]
+    fn a_picture_is_scaled_once_and_reused_across_frames() {
+        // The measurement that made this exist: 15.5ms a frame without it,
+        // 0.5ms with. Scrolling and typing both redraw, so an uncached scale is
+        // paid per keystroke.
+        let mut text = Text::new();
+        let doc = doc_with_picture(900, 1100, 0xff_ff8800);
+        let laid = lay_out(&doc, 900.0, 19.0, &text, None);
+        let (w, h) = (900usize, 600usize);
+        let mut buf = vec![0u32; w * h];
+        let mut scaled = Scaled::default();
+        for _ in 0..30 {
+            draw(&laid, &mut text, &mut scaled, &mut buf, w, h, 0.0, &Theme::DARK);
+        }
+        assert_eq!(scaled.held(), 1, "thirty frames scaled the picture more than once");
+    }
+
+    #[test]
+    fn resizing_the_window_scales_the_picture_again() {
+        // The cached copy is only right for the size it was made at. If a resize
+        // reused it the picture would be drawn at the old size into the new box.
+        let mut text = Text::new();
+        let doc = doc_with_picture(400, 400, 0xff_ff8800);
+        let (w, h) = (900usize, 600usize);
+        let mut buf = vec![0u32; w * h];
+        let mut scaled = Scaled::default();
+        for width in [300.0, 500.0] {
+            let laid = lay_out(&doc, width, 19.0, &text, None);
+            draw(&laid, &mut text, &mut scaled, &mut buf, w, h, 0.0, &Theme::DARK);
+        }
+        assert_eq!(scaled.held(), 2);
+    }
+
+    #[test]
+    fn a_picture_scrolled_off_the_top_is_not_on_the_page() {
+        let mut text = Text::new();
+        let doc = doc_with_picture(200, 100, 0xff_ff8800);
+        let laid = lay_out(&doc, 400.0, 16.0, &text, None);
+        let (w, h) = (400usize, 400usize);
+        let mut buf = vec![0u32; w * h];
+        draw(&laid, &mut text, &mut Scaled::default(), &mut buf, w, h, 5_000.0, &Theme::DARK);
+        assert!(!buf.iter().any(|p| *p == 0x00ff_8800));
+    }
+
+    #[test]
+    fn an_emoji_is_drawn_in_its_own_colours_not_the_text_colour() {
+        // The whole point. If it came out in `theme.body` the colour bitmap is
+        // being treated as a coverage mask and the picture is lost.
+        if crate::emoji::Emoji::open().is_none() {
+            eprintln!("no colour emoji font on this machine; skipping");
+            return;
+        }
+        let buf = frame("Ship it \u{1F680}\n", 500, 200, 0.0);
+        let theme = Theme::DARK;
+        let known = [theme.bg, theme.body, theme.strong, theme.dim, theme.link, theme.code];
+        let coloured = buf.iter().filter(|p| {
+            let (r, g, b) = ((*p >> 16) & 0xff, (*p >> 8) & 0xff, *p & 0xff);
+            // Something saturated: no greyscale, and not one of the theme's own.
+            r.abs_diff(g) > 40 && !known.contains(p)
+        });
+        assert!(coloured.count() > 20, "the rocket came out in the text colour");
+    }
 }
 
 /// Fill a rectangle, clipped to the buffer.
@@ -388,25 +597,7 @@ fn draw_text(
         }
         let g = text.glyph(face, ch, px);
         let (gx, gy) = (pen + g.left, baseline + g.top);
-        for row in 0..g.height {
-            let py = gy.round() as i64 + row as i64;
-            if py < 0 || py >= h as i64 {
-                continue;
-            }
-            let base = py as usize * w;
-            for col in 0..g.width {
-                let cov = g.bitmap[row * g.width + col];
-                if cov == 0 {
-                    continue;
-                }
-                let px_i = gx.round() as i64 + col as i64;
-                if px_i < 0 || px_i >= w as i64 {
-                    continue;
-                }
-                let i = base + px_i as usize;
-                buf[i] = blend(buf[i], colour, cov);
-            }
-        }
+        blit(buf, w, h, g, gx, gy, colour, 0.0);
         pen += g.advance;
     }
     pen

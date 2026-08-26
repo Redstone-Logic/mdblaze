@@ -73,6 +73,18 @@ pub enum Kind {
     Code { lang: Option<String> },
     Quote,
     Rule,
+    /// A picture.
+    ///
+    /// A block rather than something inline, even when the source wrote it in
+    /// the middle of a sentence -- a picture in a rendered document occupies a
+    /// band of the page, and inlining one would mean a line whose height varies
+    /// with what is on it. The rare inline image comes out on its own line,
+    /// which is what every renderer does with it in practice.
+    ///
+    /// `art` is what the picture turned out to be, filled in by
+    /// [`crate::media::Media::attach`]. Parsing does no IO: it runs on every
+    /// keystroke and it is a pure function of the source.
+    Image { url: String, alt: String, art: crate::media::Art },
     /// One row of a table.
     ///
     /// Rows are separate blocks rather than a table being one block with a
@@ -158,11 +170,24 @@ pub fn parse(src: &str) -> Doc {
     // Push a span onto the open block. Text outside any block (which the parser
     // does emit, e.g. between a list marker and its paragraph) opens a paragraph
     // rather than being dropped, because dropping it loses the document.
+    // The picture being read, if the parser is inside one: its URL, the alt
+    // text gathered so far, and where in the source it came from.
+    let mut picture: Option<(String, String, std::ops::Range<usize>)> = None;
+    // How many tables deep. A picture inside a table CELL stays inline as its
+    // alt text; see the image arm below.
+    let mut tabling: u32 = 0;
+    // The emphasis to restore after an inline image's alt text.
+    let mut alt_italic: Option<bool> = None;
+
     macro_rules! push_text {
         ($t:expr, $r:expr) => {{
             let t: String = $t;
             let r: std::ops::Range<usize> = $r;
-            if t.is_empty() {
+            if let Some((_, alt, _)) = picture.as_mut() {
+                // Text inside an image tag is its ALT text, which describes the
+                // picture rather than being part of the prose around it.
+                alt.push_str(&t);
+            } else if t.is_empty() {
             } else if let Some(b) = current.as_mut() {
                 // Merged with the previous run when the style matches AND the
                 // bytes follow on, so a sentence the parser split into several
@@ -186,7 +211,7 @@ pub fn parse(src: &str) -> Doc {
             }
             // Grow the block to cover what was just put in it. Only text does
             // this, so a block can never reach past its own content.
-            if let Some(b) = current.as_mut() {
+            if let Some(b) = current.as_mut().filter(|_| picture.is_none()) {
                 if let Some(last) = b.spans.last() {
                     b.source.end = b.source.end.max(last.source.end);
                 }
@@ -285,8 +310,14 @@ pub fn parse(src: &str) -> Doc {
             }
 
             // ---- tables ----------------------------------------------------
-            Event::Start(Tag::Table(_)) => close!(),
-            Event::End(TagEnd::Table) => close!(),
+            Event::Start(Tag::Table(_)) => {
+                close!();
+                tabling += 1;
+            }
+            Event::End(TagEnd::Table) => {
+                close!();
+                tabling = tabling.saturating_sub(1);
+            }
             Event::Start(Tag::TableHead) => {
                 close!();
                 current = Some(Block {
@@ -342,11 +373,44 @@ pub fn parse(src: &str) -> Doc {
             }
             Event::End(TagEnd::Link) => style.link = false,
 
-            // Images are not fetched. A document viewer that reaches the network
-            // because a file it opened said to is a document viewer that leaks
-            // which files you open, and to whom.
-            Event::Start(Tag::Image { .. }) => style.italic = true,
-            Event::End(TagEnd::Image) => style.italic = false,
+            // A picture ends the paragraph it was written in and starts again
+            // after it. See `Kind::Image`.
+            //
+            // The URL is kept as written and resolved later, by `media`, which
+            // is where the rule about what may be loaded lives. Nothing is
+            // fetched: a viewer that reaches the network because a file it
+            // opened said to is a viewer that leaks which files you open.
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                // Not inside a table. A picture in a CELL would need that row to
+                // be as tall as the picture, and the table layout sizes rows
+                // from their type -- it is measured as a grid of text, which is
+                // what makes the columns line up. Ending the row to put a
+                // picture between two of them is worse than not showing it: it
+                // takes the table apart.
+                //
+                // So in a table an image is its alt text, in italic, in the
+                // cell. Badge tables read as a list of what the badges say,
+                // which is what a badge is for.
+                if tabling > 0 {
+                    alt_italic = Some(style.italic);
+                    style.italic = true;
+                } else {
+                    close!();
+                    picture = Some((dest_url.to_string(), String::new(), range.clone()));
+                }
+            }
+            Event::End(TagEnd::Image) => {
+                if let Some(was) = alt_italic.take() {
+                    style.italic = was;
+                } else if let Some((url, alt, at)) = picture.take() {
+                    doc.blocks.push(Block {
+                        kind: Kind::Image { url, alt, art: crate::media::Art::Unresolved },
+                        spans: Vec::new(),
+                        depth,
+                        source: at,
+                    });
+                }
+            }
 
             Event::Text(t) => push_text!(t.to_string(), range.clone()),
             Event::Code(t) => {
@@ -560,5 +624,108 @@ mod tests {
     fn an_empty_document_is_empty_rather_than_one_blank_block() {
         assert!(parse("").blocks.is_empty());
         assert!(parse("\n\n   \n\n").blocks.is_empty());
+    }
+
+    fn image(b: &Block) -> (&str, &str) {
+        match &b.kind {
+            Kind::Image { url, alt, .. } => (url.as_str(), alt.as_str()),
+            other => panic!("not an image: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_image_becomes_its_own_block_carrying_the_url_and_the_alt_text() {
+        let d = parse("![a screenshot](shot.png)\n");
+        assert_eq!(d.blocks.len(), 1);
+        assert_eq!(image(&d.blocks[0]), ("shot.png", "a screenshot"));
+    }
+
+    #[test]
+    fn parsing_an_image_touches_no_filesystem() {
+        // Parsing runs on every keystroke and is a pure function of the source.
+        // The picture is looked for later, by `media`.
+        let d = parse("![](/definitely/not/here.png)\n");
+        assert!(matches!(d.blocks[0].kind, Kind::Image { ref art, .. } if *art == crate::media::Art::Unresolved));
+    }
+
+    #[test]
+    fn the_alt_text_is_not_left_in_the_prose() {
+        // It describes the picture. Rendered as ordinary text it would read as
+        // a stray sentence with no punctuation in the middle of the document.
+        let d = parse("Before.\n\n![a cat on a bench](cat.png)\n\nAfter.\n");
+        let prose: String = d
+            .blocks
+            .iter()
+            .filter(|b| !matches!(b.kind, Kind::Image { .. }))
+            .map(text)
+            .collect();
+        assert!(!prose.contains("cat on a bench"), "alt text leaked into the prose: {prose:?}");
+        assert!(prose.contains("Before.") && prose.contains("After."));
+    }
+
+    #[test]
+    fn an_image_in_the_middle_of_a_paragraph_takes_its_own_line() {
+        // A picture occupies a band of the page. Inlining one would mean a line
+        // whose height depends on what is in it -- see `Kind::Image`.
+        let d = parse("one ![pic](a.png) two\n");
+        assert_eq!(d.blocks.len(), 3, "{:?}", kinds(&d));
+        assert_eq!(d.blocks[0].kind, Kind::Paragraph);
+        assert_eq!(d.blocks[2].kind, Kind::Paragraph);
+        assert_eq!(text(&d.blocks[0]).trim(), "one");
+        assert_eq!(image(&d.blocks[1]), ("a.png", "pic"));
+        assert_eq!(text(&d.blocks[2]).trim(), "two");
+    }
+
+    #[test]
+    fn an_image_wrapped_in_a_link_is_still_the_image() {
+        // The commonest badge in a README. The link is dropped -- nothing here
+        // follows one -- and the picture is what the reader came for.
+        let d = parse("[![build](badge.png)](https://example.com/ci)\n");
+        assert_eq!(image(&d.blocks[0]), ("badge.png", "build"));
+    }
+
+    #[test]
+    fn several_images_in_a_row_are_several_blocks() {
+        let d = parse("![one](1.png)\n![two](2.png)\n![three](3.png)\n");
+        let urls: Vec<&str> = d.blocks.iter().map(|b| image(b).0).collect();
+        assert_eq!(urls, vec!["1.png", "2.png", "3.png"]);
+    }
+
+    #[test]
+    fn an_image_in_a_table_cell_stays_in_the_cell() {
+        // Badge tables are the commonest place an image appears in a README, and
+        // ending the row to make room for a picture takes the table apart --
+        // every cell becomes a paragraph of its own.
+        let d = parse(
+            "| Build | Icon |\n| --- | --- |\n| passing | ![the badge](b.png) |\n",
+        );
+        assert!(
+            d.blocks.iter().all(|b| matches!(b.kind, Kind::TableRow { .. })),
+            "the table came apart: {:?}",
+            kinds(&d)
+        );
+        let row = d.blocks.last().expect("a body row");
+        assert!(text(row).contains("the badge"), "the alt text is not in the cell: {:?}", text(row));
+        assert!(row.spans.iter().any(|s| s.style.italic), "not marked as standing in for a picture");
+    }
+
+    #[test]
+    fn emphasis_around_an_image_in_a_cell_is_put_back_afterwards() {
+        // The alt text borrows italic to mark itself. If it did not restore
+        // what was there, everything after an image in a table would be italic.
+        let d = parse("| a |\n| --- |\n| ![x](p.png) plain |\n");
+        let row = d.blocks.last().expect("row");
+        let plain = row.spans.iter().find(|s| s.text.contains("plain")).expect("the text after");
+        assert!(!plain.style.italic);
+    }
+
+    #[test]
+    fn an_image_records_where_in_the_source_it_came_from() {
+        // What lets the caret be put inside it, so a wrong path can be corrected
+        // in place rather than in another program.
+        let src = "text\n\n![alt](p.png)\n";
+        let d = parse(src);
+        let img = d.blocks.iter().find(|b| matches!(b.kind, Kind::Image { .. })).expect("image");
+        assert_eq!(&src[img.source.clone()].trim(), &"![alt](p.png)");
     }
 }

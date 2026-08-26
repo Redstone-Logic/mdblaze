@@ -27,6 +27,10 @@ ab_glyph = "0.2"
 # everything else here put together. This produces text, and text is the one
 # thing this program already knows how to draw.
 mermaid-text = "0.57"
+ttf-parser = { version = "0.25.1", default-features = false, features = ["std"] }
+png = { version = "0.18.1", default-features = false }
+zune-jpeg = { version = "0.5.15", default-features = false, features = ["std"] }
+memmap2 = "0.9.11"
 
 [profile.release]
 opt-level = 3

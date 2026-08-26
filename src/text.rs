@@ -42,7 +42,9 @@
 //! upright letterforms; a true italic redraws them, and it is the difference
 //! between emphasis that reads and emphasis that looks like a rendering fault.
 
+use crate::emoji::{is_emoji, is_joiner, Emoji};
 use ab_glyph::{Font as _, FontRef, PxScale, ScaleFont as _};
+use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
 
 /// The faces actually compiled in.
@@ -94,9 +96,23 @@ const SANS_BOLD: &[u8] = include_bytes!("../assets/fonts/NotoSans-Bold.ttf");
 const SANS_ITALIC: &[u8] = include_bytes!("../assets/fonts/NotoSans-Italic.ttf");
 const MONO: &[u8] = include_bytes!("../assets/fonts/NotoSansMono-Regular.ttf");
 
-/// A rasterised glyph: coverage values, and where to put them.
+/// What a glyph is made of.
+///
+/// Two cases rather than one because a colour emoji is not a shape to be
+/// painted in the text colour -- it arrives with its own colours, and there is
+/// no meaningful way to tint it. Keeping them apart in the type means the
+/// renderer cannot accidentally treat one as the other, which as a single
+/// `Vec<u8>` plus a flag it eventually would.
+pub enum Pixels {
+    /// Coverage, one byte per pixel. The caller supplies the colour.
+    Mask(Vec<u8>),
+    /// Finished pixels, 0xAARRGGBB. The glyph supplies its own.
+    Colour(Vec<u32>),
+}
+
+/// A rasterised glyph: its pixels, and where to put them.
 pub struct Glyph {
-    pub bitmap: Vec<u8>,
+    pub pixels: Pixels,
     pub width: usize,
     pub height: usize,
     /// Offset from the pen to the bitmap's left edge.
@@ -122,6 +138,18 @@ pub struct Text {
     sans_italic: FontRef<'static>,
     mono: FontRef<'static>,
     cache: HashMap<Key, Glyph>,
+    /// The colour emoji font, opened at most once and only if a document turns
+    /// out to contain an emoji. See [`crate::emoji`].
+    ///
+    /// A `OnceCell` because measuring takes `&self` -- a paragraph is measured
+    /// before anything is drawn -- and the first measurement is where the need
+    /// for the font is discovered.
+    emoji: OnceCell<Option<Emoji>>,
+    /// Which characters that font actually has a picture for.
+    ///
+    /// Asked once per character rather than once per measurement: wrapping walks
+    /// every character of every line, and the answer cannot change.
+    has_emoji: RefCell<HashMap<char, bool>>,
 }
 
 impl Text {
@@ -134,7 +162,38 @@ impl Text {
             sans_italic: FontRef::try_from_slice(SANS_ITALIC).expect("embedded italic is valid"),
             mono: FontRef::try_from_slice(MONO).expect("embedded mono is valid"),
             cache: HashMap::new(),
+            emoji: OnceCell::new(),
+            has_emoji: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// The colour emoji font, opening it on first use.
+    ///
+    /// A document with no emoji in it never calls this, and pays nothing.
+    fn emoji(&self) -> Option<&Emoji> {
+        self.emoji.get_or_init(Emoji::open).as_ref()
+    }
+
+    /// Will `ch` be drawn as a colour picture?
+    ///
+    /// Both halves matter. `is_emoji` is a generous range test, so a character
+    /// inside it may still have no picture -- and a character with no picture
+    /// must keep the text face's advance, or the pen moves one distance and the
+    /// glyph is drawn at another.
+    fn drawn_as_emoji(&self, ch: char) -> bool {
+        // Joiners FIRST. Skin tones live at 1F3FB, squarely inside the emoji
+        // blocks, and the emoji font has real pictures for them -- five coloured
+        // squares. Asked the other way round, every emoji written with a skin
+        // tone comes out as the emoji followed by a coloured square.
+        if is_joiner(ch) || !is_emoji(ch) {
+            return false;
+        }
+        if let Some(known) = self.has_emoji.borrow().get(&ch) {
+            return *known;
+        }
+        let has = self.emoji().is_some_and(|e| e.has(ch));
+        self.has_emoji.borrow_mut().insert(ch, has);
+        has
     }
 
     fn font(&self, face: Face) -> &FontRef<'static> {
@@ -146,10 +205,37 @@ impl Text {
         }
     }
 
+    /// How much room an emoji takes.
+    ///
+    /// In prose, a fixed multiple of the type size -- every emoji is drawn on
+    /// the same square, so they all take the same room and a line of them is
+    /// evenly spaced.
+    ///
+    /// In MONOSPACE, exactly two cells. A code block is laid out on the
+    /// assumption that every character is one cell wide, and an emoji that took
+    /// 1.24 of them would put every line containing one out of its columns.
+    /// Two cells is also what a terminal gives an emoji, so a table of them
+    /// drawn in a fence lines up here the way it does where it was written.
+    fn emoji_advance(&self, face: Face, px: f32) -> f32 {
+        match face {
+            Face::Mono => self.advance(Face::Mono, 'M', px) * 2.0,
+            _ => px * crate::emoji::EM_ADVANCE,
+        }
+    }
+
     /// How far the pen moves. Cheap enough to call per character while wrapping,
     /// and it does not rasterise -- measuring a paragraph should not fill the
     /// cache with glyphs that turn out to be off screen.
     pub fn advance(&self, face: Face, ch: char, px: f32) -> f32 {
+        // Asked BEFORE the emoji check, because skin tones and the joiners live
+        // inside the emoji blocks. Without shaping they cannot do their job, so
+        // they take no room -- see `emoji::is_joiner`.
+        if is_joiner(ch) {
+            return 0.0;
+        }
+        if self.drawn_as_emoji(ch) {
+            return self.emoji_advance(face, px);
+        }
         let f = self.font(face).as_scaled(PxScale::from(px));
         f.h_advance(f.scaled_glyph(ch).id)
     }
@@ -166,6 +252,44 @@ impl Text {
     pub fn glyph(&mut self, face: Face, ch: char, px: f32) -> &Glyph {
         let key = Key { face, ch, quarters: (px * 4.0).round() as u32 };
         if !self.cache.contains_key(&key) {
+            // A colour picture, when the emoji font has one. Decoded once and
+            // then cached beside the outline glyphs, because it is the same
+            // question -- what does this character look like at this size --
+            // and the answer costs the same to keep.
+            if self.drawn_as_emoji(ch) {
+                let advance = self.emoji_advance(face, px);
+                if let Some(r) = self.emoji().and_then(|e| e.glyph(ch, px, advance)) {
+                    let g = Glyph {
+                        width: r.bitmap.w,
+                        height: r.bitmap.h,
+                        pixels: Pixels::Colour(r.bitmap.px),
+                        left: r.left,
+                        top: r.top,
+                        advance,
+                    };
+                    self.cache.insert(key, g);
+                    let key = Key { face, ch, quarters: (px * 4.0).round() as u32 };
+                    return self.cache.get(&key).expect("just inserted");
+                }
+            }
+            // A joiner draws nothing and moves nothing: without shaping it has
+            // no job to do, and its own glyph is a blank box or a smear of
+            // colour beside the emoji it was meant to modify.
+            if is_joiner(ch) {
+                self.cache.insert(
+                    key,
+                    Glyph {
+                        pixels: Pixels::Mask(Vec::new()),
+                        width: 0,
+                        height: 0,
+                        left: 0.0,
+                        top: 0.0,
+                        advance: 0.0,
+                    },
+                );
+                let key = Key { face, ch, quarters: (px * 4.0).round() as u32 };
+                return self.cache.get(&key).expect("just inserted");
+            }
             let font = self.font(face);
             let scaled = font.as_scaled(PxScale::from(px));
             let glyph = scaled.scaled_glyph(ch);
@@ -186,12 +310,19 @@ impl Text {
                             bitmap[y * w + x] = (c * 255.0).round().clamp(0.0, 255.0) as u8;
                         }
                     });
-                    Glyph { bitmap, width: w, height: h, left: b.min.x, top: b.min.y, advance }
+                    Glyph {
+                        pixels: Pixels::Mask(bitmap),
+                        width: w,
+                        height: h,
+                        left: b.min.x,
+                        top: b.min.y,
+                        advance,
+                    }
                 }
                 // A space, or a character this face has no outline for. It still
                 // advances the pen, which is the whole of its contribution.
                 None => Glyph {
-                    bitmap: Vec::new(),
+                    pixels: Pixels::Mask(Vec::new()),
                     width: 0,
                     height: 0,
                     left: 0.0,
@@ -361,4 +492,111 @@ mod tests {
             t.line_height_with(Face::Mono, 14.0, CODE_LEADING) < t.line_height(Face::Mono, 14.0)
         );
     }
+    // ---- emoji ---------------------------------------------------------
+
+    /// Whether this machine has a colour emoji font at all. Everything below
+    /// asserts what happens WHEN it does; without one, the fallback is that
+    /// nothing changes, which the assertions about advances still cover.
+    fn has_colour() -> bool {
+        crate::emoji::Emoji::open().is_some()
+    }
+
+    #[test]
+    fn an_emoji_is_drawn_as_a_picture_rather_than_an_outline() {
+        if !has_colour() {
+            eprintln!("no colour emoji font on this machine; skipping");
+            return;
+        }
+        let mut t = Text::new();
+        let g = t.glyph(Face::Sans, '\u{1F680}', 19.0);
+        assert!(matches!(g.pixels, Pixels::Colour(_)), "the rocket came out as an outline");
+        assert!(g.width > 15 && g.height > 15, "{}x{}", g.width, g.height);
+    }
+
+    #[test]
+    fn an_emoji_takes_more_room_on_the_line_than_a_letter() {
+        if !has_colour() {
+            return;
+        }
+        let t = Text::new();
+        assert!(t.advance(Face::Sans, '\u{1F680}', 19.0) > t.advance(Face::Sans, 'M', 19.0));
+    }
+
+    #[test]
+    fn the_room_reserved_for_an_emoji_is_the_room_it_is_drawn_in() {
+        // Measuring happens before drawing, and the two must agree. If the pen
+        // moved by less than the picture is wide, every emoji would overlap the
+        // character after it.
+        if !has_colour() {
+            return;
+        }
+        let mut t = Text::new();
+        let reserved = t.advance(Face::Sans, '\u{1F600}', 19.0);
+        let g = t.glyph(Face::Sans, '\u{1F600}', 19.0);
+        assert!((g.advance - reserved).abs() < 0.01, "{} drawn, {reserved} measured", g.advance);
+        assert!(g.left >= -0.01 && g.left + g.width as f32 <= reserved + 1.0, "it sticks out of its own advance");
+    }
+
+    #[test]
+    fn an_emoji_in_a_code_block_is_exactly_two_columns() {
+        // A code block is laid out on the assumption that every character is one
+        // cell wide. An emoji of 1.24 cells puts every line containing one out
+        // of its columns -- and two cells is what a terminal gives it, so a
+        // table drawn in a fence lines up here the way it did where it was
+        // written.
+        if !has_colour() {
+            return;
+        }
+        let t = Text::new();
+        let cell = t.advance(Face::Mono, 'M', 14.0);
+        let emoji = t.advance(Face::Mono, '\u{2705}', 14.0);
+        assert!((emoji - cell * 2.0).abs() < 0.01, "{emoji} against a cell of {cell}");
+    }
+
+    #[test]
+    fn a_sequence_part_takes_no_room_and_draws_nothing() {
+        // `\u{26A0}\u{FE0F}` is one warning sign, written as two characters.
+        // Without shaping the selector cannot do its job; given a width it would
+        // put a gap or a blank box beside every emoji written the long way.
+        let mut t = Text::new();
+        for c in ['\u{FE0F}', '\u{200D}', '\u{1F3FB}'] {
+            assert_eq!(t.advance(Face::Sans, c, 19.0), 0.0, "{c:?} took room");
+            let g = t.glyph(Face::Sans, c, 19.0);
+            assert_eq!((g.width, g.height, g.advance), (0, 0, 0.0), "{c:?} drew something");
+        }
+    }
+
+    #[test]
+    fn a_warning_sign_written_the_long_way_measures_the_same_as_the_short_way() {
+        // The commonest emoji in a document about software, and it is almost
+        // always written with the variation selector after it.
+        if !has_colour() {
+            return;
+        }
+        let t = Text::new();
+        assert_eq!(t.width(Face::Sans, "\u{26A0}\u{FE0F}", 19.0), t.width(Face::Sans, "\u{26A0}", 19.0));
+    }
+
+    #[test]
+    fn ordinary_text_is_unaffected_by_any_of_this() {
+        // The emoji path must not change a document that has none in it -- and
+        // must not open the font for one.
+        let t = Text::new();
+        let s = "The quick brown fox jumps over the lazy dog.";
+        let sum: f32 = s.chars().map(|c| t.advance(Face::Sans, c, 19.0)).sum();
+        assert!((t.width(Face::Sans, s, 19.0) - sum).abs() < 0.001);
+    }
+
+    #[test]
+    fn a_colour_glyph_is_rasterised_once_like_any_other() {
+        if !has_colour() {
+            return;
+        }
+        let mut t = Text::new();
+        for _ in 0..20 {
+            let _ = t.glyph(Face::Sans, '\u{1F389}', 19.0);
+        }
+        assert_eq!(t.cached(), 1, "the emoji was decoded more than once");
+    }
+
 }

@@ -34,8 +34,13 @@ Speed decides the architecture rather than being tuned for afterwards.
   number, so laying out is one ordered walk.
 - **No HTML.** The console renders markdown to HTML because a browser consumes it
   there. Here the consumer is a rasteriser.
-- **No font system.** The faces are compiled in. Asking the OS what fonts exist
-  is the most reliable way to lose the whole budget.
+- **No font system.** The text faces are compiled in. Asking the OS what fonts
+  exist is the most reliable way to lose the whole budget. The one exception is
+  colour emoji: 10.8MB is too much to put in every copy of the binary for a
+  feature most documents do not use, so the file is opened from a list of four
+  absolute paths -- a list, not a scan -- and only once a document turns out to
+  contain an emoji. It is mapped rather than read, so an emoji costs the two
+  pages its own picture is on.
 - **A lazy font reader.** The first version used an eager one and paid 36ms *per
   face* -- 100ms, 95% of startup, to build outlines for glyphs no document uses.
   Avoiding fontconfig and then parsing the fonts anyway is not a saving.
@@ -105,6 +110,23 @@ at the exact moment someone asked for their work to be kept.
 - **Noto Sans, whatever you have installed.** No coverage for scripts the
   embedded faces lack -- CJK, Arabic, Devanagari render as missing glyphs. The
   fix is to embed more coverage, not to start asking the system.
+- **Pictures are local, and PNG or JPEG.** A markdown file arrives from
+  anywhere, and one that says `![](https://...)` is asking this program to tell
+  a stranger which files you open and when. Remote images are not fetched and
+  there is no setting to fetch them; the alt text and the reason are shown
+  instead. Everything else -- GIF, WebP, AVIF, SVG -- is a decoder's worth of
+  code and attack surface for a format that does not turn up in a document about
+  software.
+- **Emoji sequences render as their base character.** A skin tone, a variation
+  selector or a zero-width joiner needs the font's ligature substitutions
+  applied, which means a shaping engine. A family comes out as its first member
+  and a waving hand in the font's default yellow. In prose an emoji takes a
+  fixed multiple of the type size; in a code fence, exactly two columns, which
+  is what a terminal gives it.
+- **A picture in a table cell shows its alt text.** A picture in a cell would
+  need that row to be as tall as the picture, and the table is measured as a
+  grid of type -- which is what makes the columns line up. Badge tables read as
+  a list of what the badges say.
 - **Mermaid diagrams render as box drawing**, not as pictures. The SVG renderers
   need a rasteriser, and the obvious one pulls 84 crates including `fontdb` --
   the font scanning this program exists without. A diagram that will not parse

@@ -36,7 +36,8 @@ use mdedit::doc;
 use mdedit::edit::Buffer;
 use mdedit::file;
 use mdedit::layout::{self, Editing, Laid};
-use mdedit::render::{self, Theme};
+use mdedit::media::Media;
+use mdedit::render::{self, Scaled, Theme};
 use mdedit::text::Text;
 
 use winit::application::ApplicationHandler;
@@ -75,6 +76,13 @@ struct App {
     path: Option<std::path::PathBuf>,
     buffer: Buffer,
     text: Text,
+    /// The decoded pictures of this document, kept across reflows. The document
+    /// is reparsed on every keystroke and decoding a screenshot is milliseconds;
+    /// without this, typing beside a picture would be visibly slow.
+    media: Media,
+    /// Pictures at the size they are on screen. Rebuilding them every frame cost
+    /// fifteen milliseconds a keystroke; see [`Scaled`].
+    scaled: Scaled,
     laid: Laid,
     laid_for: f32,
     scroll: f32,
@@ -108,7 +116,10 @@ impl App {
     fn reflow(&mut self, width: f32) {
         let source = self.buffer.text();
         let cursor = self.buffer.byte_offset();
-        let parsed = doc::parse(&source);
+        let mut parsed = doc::parse(&source);
+        // Resolved here rather than in the parser, which does no IO on purpose:
+        // it runs on every keystroke and is a pure function of the source.
+        self.media.attach(&mut parsed);
         self.laid = layout::lay_out(
             &parsed,
             width,
@@ -400,7 +411,8 @@ impl ApplicationHandler for App {
                 surface.resize(w, h).expect("resize");
                 let mut buf = surface.buffer_mut().expect("buffer");
                 render::draw(
-                    &self.laid, &mut self.text, &mut buf, width, height, scroll, &Theme::DARK,
+                    &self.laid, &mut self.text, &mut self.scaled, &mut buf, width, height,
+                    scroll, &Theme::DARK,
                 );
                 render::draw_status(
                     &mut self.text, &mut buf, width, height, BASE, &Theme::DARK, &name, dirty,
@@ -502,7 +514,12 @@ fn main() {
     let buffer = Buffer::from_str(&source);
     // Parsed and laid out before the window opens, so the first frame has
     // something to draw the instant the surface exists rather than a frame later.
-    let parsed = doc::parse(&source);
+    let mut parsed = doc::parse(&source);
+    // Pictures are resolved against the DOCUMENT's directory, not the working
+    // directory -- a file opened by double-click inherits whatever directory the
+    // desktop happened to be in.
+    let mut media = Media::for_document(path.as_deref());
+    media.attach(&mut parsed);
     let laid = layout::lay_out(&parsed, 900.0, BASE, &text, None);
     if timing {
         eprintln!(
@@ -519,7 +536,7 @@ fn main() {
         let mut buf = vec![0u32; w * h];
         let editing = shot_cursor.map(|cursor| Editing { source: &source, cursor });
         let laid = layout::lay_out(&parsed, w as f32, BASE, &text2, editing);
-        render::draw(&laid, &mut text2, &mut buf, w, h, 0.0, &Theme::DARK);
+        render::draw(&laid, &mut text2, &mut Scaled::default(), &mut buf, w, h, 0.0, &Theme::DARK);
         render::draw_status(
             &mut text2,
             &mut buf,
@@ -557,6 +574,8 @@ fn main() {
         path,
         buffer,
         text,
+        media,
+        scaled: Scaled::default(),
         laid,
         laid_for: 900.0,
         scroll: 0.0,

@@ -16,9 +16,16 @@
 //!     a depth number. Laying out is then one ordered walk.
 //!   - **No HTML.** The console renders markdown to HTML because a browser
 //!     consumes it there. Here the consumer is a rasteriser.
-//!   - **No font system.** The face is compiled in. Asking the OS what fonts
-//!     exist is the single most reliable way to lose the entire budget, and it
-//!     is a question this program never needs answered.
+//!   - **No font system.** The text faces are compiled in. Asking the OS what
+//!     fonts exist is the single most reliable way to lose the entire budget,
+//!     and it is a question this program never needs answered. Colour emoji are
+//!     the one exception and they are handled the same way in spirit: four
+//!     absolute paths, tried only once a document turns out to have an emoji in
+//!     it, and mapped rather than read. See [`emoji`].
+//!   - **Pictures, and nothing fetched.** PNG and JPEG, from disk, resolved
+//!     beside the document. A viewer that reaches the network because a file it
+//!     opened said to is a viewer that leaks which files you open. See
+//!     [`media`].
 //!   - **No GPU.** Creating a graphics context costs more than everything else
 //!     here put together, to draw static text.
 //!   - **No index, no vault, no workspace.** One file, opened.
@@ -33,7 +40,10 @@ pub mod code;
 pub mod desktop;
 pub mod doc;
 pub mod edit;
+pub mod emoji;
 pub mod file;
 pub mod layout;
+pub mod media;
+pub mod pixels;
 pub mod render;
 pub mod text;
