@@ -165,3 +165,28 @@ at the exact moment someone asked for their work to be kept.
 - **The product now renders markdown twice** -- HTML in the console, this here --
   and the two can drift. Accepted because this opens arbitrary files rather than
   organisation content, so they never render the same document.
+
+## Licence
+
+Dual licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. This is the Rust ecosystem convention: MIT is the permissive
+default most projects expect, and Apache-2.0 adds an explicit patent grant that
+some organisations require before they can use anything.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this work by you, as defined in the Apache-2.0 licence, shall
+be dual licensed as above, without any additional terms or conditions.
+
+**The four Noto faces in `assets/fonts/` are not covered by either.** They are
+SIL Open Font License 1.1, and because they are compiled into the binary that
+licence travels with any copy of it, source or built. The OFL permits bundling
+fonts inside software and selling that software; it forbids selling the fonts on
+their own, which nothing here does. See [NOTICE](NOTICE) — it also covers the
+colour emoji font, which is *not* shipped at all, only opened read-only from the
+machine it runs on.
+
+Copyright (c) 2026 Redstone Logic.

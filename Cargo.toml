@@ -3,7 +3,14 @@ name = "mdblaze"
 version = "0.1.0"
 edition = "2021"
 description = "A markdown editor that renders, and opens instantly."
-license = "Proprietary"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["markdown", "editor", "viewer", "gui", "startup"]
+categories = ["text-editors", "gui", "text-processing"]
+# The Noto faces are compiled in and are SIL OFL 1.1, not MIT/Apache. The SPDX
+# field above describes the CODE, which is the convention; see NOTICE for what
+# the binary actually contains and what travels with it.
+exclude = ["/tests/fixtures", "*.ppm"]
 
 [dependencies]
 # The parser only. This crate lays text out itself rather than producing HTML,
