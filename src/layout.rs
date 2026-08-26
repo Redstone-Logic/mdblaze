@@ -887,6 +887,7 @@ fn lay_table(
 /// The revealed block is drawn in mono on a tinted ground: it is source, and
 /// making it look like source is the point -- the reader can see exactly which
 /// characters they are changing, which is what a rendered-only editor cannot say.
+#[allow(clippy::too_many_arguments)]
 fn lay_revealed(
     out: &mut Laid,
     text: &Text,

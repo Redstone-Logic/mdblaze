@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The point of this job, and the reason it is a matrix rather than one runner:
+  # this program is developed on Linux and its macOS and Windows paths have never
+  # been run by a person. Here they are at least run by a machine.
+  test:
+    name: test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # winit and softbuffer link against the X11 and Wayland client libraries.
+      # The runner image has neither, and the failure looks like a Rust problem.
+      - name: system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxkbcommon-x11-dev
+
+      # Colour emoji come from a font on the machine rather than one shipped in
+      # the binary, so without this the emoji tests skip themselves on Linux and
+      # prove nothing.
+      - name: colour emoji font
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y fonts-noto-color-emoji
+
+      - run: cargo build --all-targets
+      - run: cargo test
+      - run: cargo clippy --all-targets -- -D warnings
+
+  # Nothing here needs a Mac or a PC, so it stays fast and catches a portability
+  # break in the time it takes to type-check rather than the time it takes to run
+  # three runners.
+  cross-check:
+    name: check other targets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-pc-windows-msvc
+      - name: system libraries
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
+      - run: cargo check --target aarch64-apple-darwin --all-targets
+      - run: cargo check --target x86_64-pc-windows-msvc --all-targets

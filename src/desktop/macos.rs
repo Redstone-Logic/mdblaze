@@ -35,7 +35,12 @@
 //! Get Info, and the report says so rather than leaving somebody to wonder why
 //! double-click did not change.
 
-use super::{DESCRIPTION, EXTENSIONS, FORMER_NAMES, NAME};
+// `FORMER_NAMES` is referenced through `super::` at its two use sites rather
+// than imported, because both of them are inside `#[cfg(target_os = "macos")]`.
+// Imported, it reads as unused on every other platform -- and `cargo clippy
+// --fix` duly deleted it, which compiled cleanly on Linux and broke the macOS
+// build. The cross-target check caught it; nothing else would have.
+use super::{DESCRIPTION, EXTENSIONS, NAME};
 use std::path::{Path, PathBuf};
 
 /// The Uniform Type Identifier for markdown.
@@ -141,7 +146,7 @@ pub(super) fn install() -> std::io::Result<Vec<String>> {
 
     // A former name's bundle first: two bundles claiming markdown is exactly the
     // ambiguity the rename was supposed to remove.
-    for former in FORMER_NAMES {
+    for former in super::FORMER_NAMES {
         let old = bundle_path(former);
         if old.exists() {
             std::fs::remove_dir_all(&old)?;
@@ -181,7 +186,7 @@ pub(super) fn install() -> std::io::Result<Vec<String>> {
 #[cfg(target_os = "macos")]
 pub(super) fn uninstall() -> std::io::Result<Vec<String>> {
     let mut said = Vec::new();
-    for name in FORMER_NAMES.iter().copied().chain([NAME]) {
+    for name in super::FORMER_NAMES.iter().copied().chain([NAME]) {
         let app = bundle_path(name);
         if app.exists() {
             std::fs::remove_dir_all(&app)?;

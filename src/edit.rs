@@ -88,6 +88,8 @@ pub fn boundary(s: &str, byte: usize) -> usize {
 }
 
 impl Buffer {
+    // Not `std::str::FromStr`: that returns a Result and this cannot fail.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(text: &str) -> Self {
         // A trailing newline is a line terminator, not an empty last line: split
         // would otherwise invent a blank line at the end of every well-formed

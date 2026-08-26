@@ -120,11 +120,10 @@ fn ini_set(content: &str, section: &str, key: &str, value: Option<&str>) -> Stri
         if in_section {
             if let Some((k, _)) = t.split_once('=') {
                 if k.trim() == key {
-                    match value {
-                        Some(v) => out.push(format!("{key}={v}")),
-                        // None removes it, which is what restoring a MIME type
-                        // that had no default before means.
-                        None => {}
+                    // `None` removes the line, which is what restoring a MIME
+                    // type that had no default before means.
+                    if let Some(v) = value {
+                        out.push(format!("{key}={v}"));
                     }
                     wrote = true;
                     continue;
@@ -138,14 +137,14 @@ fn ini_set(content: &str, section: &str, key: &str, value: Option<&str>) -> Stri
         if let Some(v) = value {
             out.push(format!("{key}={v}"));
         }
-        wrote = true;
-    }
-    if !seen_section && value.is_some() {
-        if !out.is_empty() && !out.last().is_some_and(|l| l.trim().is_empty()) {
-            out.push(String::new());
+    } else if !seen_section {
+        if let Some(v) = value {
+            if !out.is_empty() && !out.last().is_some_and(|l| l.trim().is_empty()) {
+                out.push(String::new());
+            }
+            out.push(section.to_string());
+            out.push(format!("{key}={v}"));
         }
-        out.push(section.to_string());
-        out.push(format!("{key}={}", value.expect("checked")));
     }
 
     let mut s = out.join("\n");

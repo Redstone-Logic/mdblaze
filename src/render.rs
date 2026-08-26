@@ -49,7 +49,7 @@ impl Theme {
         // what you understand -- what runs, what is text, what is a number, and
         // what the machine ignores.
         keyword: 0x00d8_8a84,
-        string: 0x008fb8_78 & 0x00ff_ffff,
+        string: 0x008f_b878,
         number: 0x00d2_b078,
         comment: 0x0080_8080,
         bar: 0x001b_1b1b,
@@ -169,6 +169,10 @@ pub struct Scaled {
 /// on a raw pointer without holding the thing it points at and a freed-then-
 /// reallocated bitmap silently answers with somebody else's pixels.
 struct Entry {
+    /// Never read, and that is the point: holding it keeps the allocation the
+    /// key names alive, so the address cannot be reused by a different picture.
+    /// Dropping this field would compile and would silently reintroduce that.
+    #[allow(dead_code)]
     source: std::rc::Rc<crate::pixels::Bitmap>,
     w: usize,
     h: usize,
@@ -332,6 +336,103 @@ pub fn draw(
     }
 }
 
+/// Fill a rectangle, clipped to the buffer.
+#[allow(clippy::too_many_arguments)]
+fn fill(buf: &mut [u32], w: usize, h: usize, x: f32, y: f32, rw: f32, rh: f32, colour: u32) {
+    let x0 = x.round().max(0.0) as usize;
+    let y0 = y.round().max(0.0) as usize;
+    let x1 = ((x + rw).round().max(0.0) as usize).min(w);
+    let y1 = ((y + rh).round().max(0.0) as usize).min(h);
+    for row in y0..y1 {
+        let base = row * w;
+        for col in x0..x1 {
+            buf[base + col] = colour;
+        }
+    }
+}
+
+/// Draw one run of text at a baseline. Returns where the pen ended.
+#[allow(clippy::too_many_arguments)]
+fn draw_text(
+    text: &mut Text,
+    buf: &mut [u32],
+    w: usize,
+    h: usize,
+    x: f32,
+    baseline: f32,
+    s: &str,
+    face: Face,
+    px: f32,
+    colour: u32,
+) -> f32 {
+    let mut pen = x;
+    for ch in s.chars() {
+        if ch == ' ' {
+            pen += text.advance(face, ch, px);
+            continue;
+        }
+        let g = text.glyph(face, ch, px);
+        let (gx, gy) = (pen + g.left, baseline + g.top);
+        blit(buf, w, h, g, gx, gy, colour, 0.0);
+        pen += g.advance;
+    }
+    pen
+}
+
+/// How tall the status line is at a given base size.
+pub fn status_height(base: f32) -> f32 {
+    base * 1.9
+}
+
+/// One line at the bottom: what file, whether it is modified, and what to press.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_status(
+    text: &mut Text,
+    buf: &mut [u32],
+    width: usize,
+    height: usize,
+    base: f32,
+    theme: &Theme,
+    name: &str,
+    dirty: bool,
+    note: Option<&str>,
+    // Set while closing would discard unsaved work. The whole bar changes
+    // colour, because a line of grey text at the bottom of a window is not a
+    // warning -- it is a place warnings go to be missed.
+    alarm: bool,
+) {
+    let bh = status_height(base);
+    let top = height as f32 - bh;
+    let ground = if alarm { theme.alarm_bg } else { theme.bar };
+    fill(buf, width, height, 0.0, top, width as f32, bh, ground);
+    if alarm {
+        // A rule along the top edge, so the bar reads as a band rather than as
+        // the window having changed colour for no reason.
+        fill(buf, width, height, 0.0, top, width as f32, 2.0, theme.caret);
+    }
+
+    let px = base * 0.78;
+    let baseline = top + (bh + text.ascent(Face::Sans, px)) / 2.0 - base * 0.22;
+    let mut x = draw_text(
+        text, buf, width, height, PAD, baseline, name, Face::SansBold, px, theme.strong,
+    );
+    let hint_ink = if alarm { theme.strong } else { theme.dim };
+    if dirty {
+        // A word, not a symbol. "modified" needs no key and cannot be mistaken
+        // for decoration the way a lone dot can.
+        // On the alarm ground the accent nearly disappears into it, so the word
+        // that says WHY the bar is red has to stop being the same colour as the
+        // bar. It is the one word that must stay legible there.
+        let ink = if alarm { theme.strong } else { theme.caret };
+        x = draw_text(text, buf, width, height, x + base * 0.5, baseline, "modified", Face::Sans, px, ink);
+    }
+    let hint = note.unwrap_or("Ctrl+S save  ·  Ctrl+Z undo  ·  Esc close");
+    let hw = text.width(if alarm { Face::SansBold } else { Face::Sans }, hint, px);
+    let hx = (width as f32 - PAD - hw).max(x + base);
+    let hint_face = if alarm { Face::SansBold } else { Face::Sans };
+    draw_text(text, buf, width, height, hx, baseline, hint, hint_face, px, hint_ink);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,7 +505,7 @@ mod tests {
         let mut buf = vec![0u32; w * h];
         draw(&laid, &mut text, &mut Scaled::default(), &mut buf, w, h, 0.0, &Theme::DARK);
         assert!(
-            buf.iter().any(|p| *p == Theme::DARK.caret),
+            buf.contains(&Theme::DARK.caret),
             "the caret was never painted"
         );
     }
@@ -412,14 +513,14 @@ mod tests {
     #[test]
     fn no_caret_is_drawn_when_not_editing() {
         let buf = frame("# Title\n\nbody\n", 600, 400, 0.0);
-        assert!(!buf.iter().any(|p| *p == Theme::DARK.caret));
+        assert!(!buf.contains(&Theme::DARK.caret));
     }
 
     #[test]
     fn a_code_block_paints_its_own_ground() {
         let buf = frame("```\ncode here\n```\n", 500, 300, 0.0);
         assert!(
-            buf.iter().any(|p| *p == Theme::DARK.code_bg),
+            buf.contains(&Theme::DARK.code_bg),
             "no code ground was drawn"
         );
     }
@@ -636,7 +737,7 @@ mod tests {
         let (w, h) = (400usize, 400usize);
         let mut buf = vec![0u32; w * h];
         draw(&laid, &mut text, &mut Scaled::default(), &mut buf, w, h, 5_000.0, &Theme::DARK);
-        assert!(!buf.iter().any(|p| *p == 0x00ff_8800));
+        assert!(!buf.contains(&0x00ff_8800));
     }
 
     #[test]
@@ -651,104 +752,10 @@ mod tests {
         let theme = Theme::DARK;
         let known = [theme.bg, theme.body, theme.strong, theme.dim, theme.link, theme.code];
         let coloured = buf.iter().filter(|p| {
-            let (r, g, b) = ((*p >> 16) & 0xff, (*p >> 8) & 0xff, *p & 0xff);
+            let (r, g, _b) = ((*p >> 16) & 0xff, (*p >> 8) & 0xff, *p & 0xff);
             // Something saturated: no greyscale, and not one of the theme's own.
             r.abs_diff(g) > 40 && !known.contains(p)
         });
         assert!(coloured.count() > 20, "the rocket came out in the text colour");
     }
-}
-
-/// Fill a rectangle, clipped to the buffer.
-fn fill(buf: &mut [u32], w: usize, h: usize, x: f32, y: f32, rw: f32, rh: f32, colour: u32) {
-    let x0 = x.round().max(0.0) as usize;
-    let y0 = y.round().max(0.0) as usize;
-    let x1 = ((x + rw).round().max(0.0) as usize).min(w);
-    let y1 = ((y + rh).round().max(0.0) as usize).min(h);
-    for row in y0..y1 {
-        let base = row * w;
-        for col in x0..x1 {
-            buf[base + col] = colour;
-        }
-    }
-}
-
-/// Draw one run of text at a baseline. Returns where the pen ended.
-fn draw_text(
-    text: &mut Text,
-    buf: &mut [u32],
-    w: usize,
-    h: usize,
-    x: f32,
-    baseline: f32,
-    s: &str,
-    face: Face,
-    px: f32,
-    colour: u32,
-) -> f32 {
-    let mut pen = x;
-    for ch in s.chars() {
-        if ch == ' ' {
-            pen += text.advance(face, ch, px);
-            continue;
-        }
-        let g = text.glyph(face, ch, px);
-        let (gx, gy) = (pen + g.left, baseline + g.top);
-        blit(buf, w, h, g, gx, gy, colour, 0.0);
-        pen += g.advance;
-    }
-    pen
-}
-
-/// How tall the status line is at a given base size.
-pub fn status_height(base: f32) -> f32 {
-    base * 1.9
-}
-
-/// One line at the bottom: what file, whether it is modified, and what to press.
-pub fn draw_status(
-    text: &mut Text,
-    buf: &mut [u32],
-    width: usize,
-    height: usize,
-    base: f32,
-    theme: &Theme,
-    name: &str,
-    dirty: bool,
-    note: Option<&str>,
-    // Set while closing would discard unsaved work. The whole bar changes
-    // colour, because a line of grey text at the bottom of a window is not a
-    // warning -- it is a place warnings go to be missed.
-    alarm: bool,
-) {
-    let bh = status_height(base);
-    let top = height as f32 - bh;
-    let ground = if alarm { theme.alarm_bg } else { theme.bar };
-    fill(buf, width, height, 0.0, top, width as f32, bh, ground);
-    if alarm {
-        // A rule along the top edge, so the bar reads as a band rather than as
-        // the window having changed colour for no reason.
-        fill(buf, width, height, 0.0, top, width as f32, 2.0, theme.caret);
-    }
-
-    let px = base * 0.78;
-    let baseline = top + (bh + text.ascent(Face::Sans, px)) / 2.0 - base * 0.22;
-    let mut x = draw_text(
-        text, buf, width, height, PAD, baseline, name, Face::SansBold, px, theme.strong,
-    );
-    let hint_ink = if alarm { theme.strong } else { theme.dim };
-    if dirty {
-        // A word, not a symbol. "modified" needs no key and cannot be mistaken
-        // for decoration the way a lone dot can.
-        // On the alarm ground the accent nearly disappears into it, so the word
-        // that says WHY the bar is red has to stop being the same colour as the
-        // bar. It is the one word that must stay legible there.
-        let ink = if alarm { theme.strong } else { theme.caret };
-        x = draw_text(text, buf, width, height, x + base * 0.5, baseline, "modified", Face::Sans, px, ink);
-    }
-    let hint = note.unwrap_or("Ctrl+S save  ·  Ctrl+Z undo  ·  Esc close");
-    let hw = text.width(if alarm { Face::SansBold } else { Face::Sans }, hint, px);
-    let hx = (width as f32 - PAD - hw).max(x + base);
-    let hint_face = if alarm { Face::SansBold } else { Face::Sans };
-    draw_text(text, buf, width, height, hx, baseline, hint, hint_face, px, hint_ink);
 }
