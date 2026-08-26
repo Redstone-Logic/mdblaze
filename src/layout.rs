@@ -79,6 +79,10 @@ pub enum Ink {
     Str,
     Number,
     Comment,
+    /// Not a colour for text: the ground behind selected text. It arrives as a
+    /// [`Shape`], never as a [`Run`], and the renderer fills rather than draws
+    /// it.
+    Select,
 }
 
 /// A run of text on one line, ready to draw.
@@ -149,6 +153,23 @@ pub struct Editing<'a> {
     pub source: &'a str,
     /// The cursor, as a byte offset into `source`.
     pub cursor: usize,
+    /// Which byte decides the block that shows its markdown.
+    ///
+    /// Normally the cursor, and separate from it for one case: a selection, where
+    /// it is the ANCHOR. Revealing a block changes its height, so following the
+    /// cursor here would re-lay the document on every pixel of a drag, moving the
+    /// text out from under the pointer selecting it. The anchor does not move
+    /// while a selection grows, so nothing jumps.
+    pub reveal: usize,
+    /// The selected source bytes, low end first, to draw a ground behind.
+    pub selection: Option<(usize, usize)>,
+}
+
+impl<'a> Editing<'a> {
+    /// The ordinary case: a cursor, no selection, revealing the block it is in.
+    pub fn at(source: &'a str, cursor: usize) -> Self {
+        Editing { source, cursor, reveal: cursor, selection: None }
+    }
 }
 
 /// Point size for each block kind at a base size.
@@ -274,7 +295,7 @@ pub fn lay_out(
     let mut prev: Option<Kind> = None;
 
     // Which block, if any, shows its source instead of its rendering.
-    let reveal = editing.and_then(|e| doc.block_at(e.cursor));
+    let reveal = editing.and_then(|e| doc.block_at(e.reveal));
     // The end of the last block passed, so a cursor sitting in the blank line
     // between two blocks can still be given somewhere to be.
     let mut prev_source_end = 0usize;
@@ -574,8 +595,132 @@ pub fn lay_out(
         }
     }
 
+    if let Some((a, b)) = editing.and_then(|e| e.selection) {
+        lay_selection(&mut out, text, a, b);
+    }
+
     out.height = y + PAD;
     out
+}
+
+/// Put a ground behind every run that overlaps the selected source bytes.
+///
+/// A pass over the finished runs rather than something each block does for
+/// itself, because every run already records the source byte it started at --
+/// that is what a click resolves through -- so the selection can be drawn once,
+/// at the end, without a single block type knowing selections exist.
+///
+/// It is exactly as accurate as clicking is, and for the same reason: walking a
+/// run's RENDERED characters to find source offsets assumes the two are the same
+/// length, which holds for plain text and drifts wherever the parser resolved
+/// something -- `&hellip;` is eight source bytes and three rendered ones. So the
+/// edge of a highlight can sit a character out beside constructs like that. The
+/// bytes COPIED are the buffer's own and are exact; it is only the drawing that
+/// approximates.
+fn lay_selection(out: &mut Laid, text: &Text, a: usize, b: usize) {
+    /// One run's worth of ground, before the line it is on has been squared up.
+    struct Band {
+        baseline: f32,
+        x: f32,
+        right: f32,
+        top: f32,
+        bottom: f32,
+        /// Whether the selection carries on past this run, so the LAST band on a
+        /// line can show that the newline was taken too.
+        runs_on: bool,
+        face: Face,
+        px: f32,
+    }
+
+    // Collected first and squared up after, because this iterates the runs it
+    // would otherwise be pushing alongside.
+    let mut bands: Vec<Band> = Vec::new();
+    for r in &out.runs {
+        // Zero-width anchors -- the invisible run that gives a picture something
+        // to be clicked on -- would otherwise contribute a band with no width.
+        if r.text.is_empty() {
+            continue;
+        }
+        let end = r.source + r.text.len();
+        if end <= a || r.source >= b {
+            continue;
+        }
+        // Walk the run's characters accumulating x, and keep the span between
+        // where the selection starts and where it ends.
+        let (mut pen, mut at) = (r.x, r.source);
+        let (mut from, mut to) = (None, r.x);
+        for ch in r.text.chars() {
+            if from.is_none() && at >= a {
+                from = Some(pen);
+            }
+            pen += text.advance(r.face, ch, r.px);
+            at += ch.len_utf8();
+            if at <= b {
+                to = pen;
+            }
+        }
+        let from = from.unwrap_or(r.x);
+        if to <= from {
+            continue;
+        }
+        // From the top of the glyphs down by one line's worth, so consecutive
+        // selected lines meet and read as one block rather than as stripes.
+        let top = r.baseline - text.ascent(r.face, r.px);
+        bands.push(Band {
+            baseline: r.baseline,
+            x: from,
+            right: to,
+            top,
+            bottom: top + text.line_height(r.face, r.px),
+            runs_on: b > end,
+            face: r.face,
+            px: r.px,
+        });
+    }
+
+    // Square each visual line off to one height.
+    //
+    // Without this, a line holding both prose and `inline code` gets two bands of
+    // different heights, because the two faces have different ascents -- and the
+    // step between them reads as a rendering fault rather than as one selection.
+    // Runs on one line share a baseline, so that is the grouping key.
+    for i in 0..bands.len() {
+        let (mut top, mut bottom) = (bands[i].top, bands[i].bottom);
+        for other in &bands {
+            if (other.baseline - bands[i].baseline).abs() < 0.5 {
+                top = top.min(other.top);
+                bottom = bottom.max(other.bottom);
+            }
+        }
+        bands[i].top = top;
+        bands[i].bottom = bottom;
+    }
+
+    // A selected line break gets a little ground of its own past the last word.
+    //
+    // Otherwise a selection running through several lines reads as several
+    // separate selections of words, with no way to see that the newlines between
+    // them were taken as well -- which they were, and which is what gets copied.
+    for i in 0..bands.len() {
+        let last = bands
+            .iter()
+            .filter(|o| (o.baseline - bands[i].baseline).abs() < 0.5)
+            .all(|o| o.right <= bands[i].right + 0.01);
+        if bands[i].runs_on && last {
+            bands[i].right += text.advance(bands[i].face, ' ', bands[i].px);
+        }
+    }
+
+    // A selection reaching past the last run -- to the end of a document, or over
+    // trailing blank lines -- has nothing to sit behind, and drawing nothing is
+    // right: there is no text there to show as taken.
+    out.shapes.extend(bands.iter().map(|g| Shape {
+        x: g.x,
+        y: g.top,
+        w: g.right - g.x,
+        h: g.bottom - g.top,
+        ink: Ink::Select,
+    }));
 }
 
 impl Laid {
@@ -641,6 +786,24 @@ impl Laid {
         // Past the end of the line: its end.
         let last = on_line.last()?;
         Some(last.source + last.text.len())
+    }
+
+    /// How far down the page the selection's ground reaches, as (top, bottom).
+    ///
+    /// What lets the view follow a selection that has grown past the bottom of
+    /// the window. The caret cannot do that job: a caret is only placed inside
+    /// the block showing its markdown, so a selection reaching past that block
+    /// leaves the layout with no caret at all -- and without this, Shift+Down
+    /// would go on selecting text nobody can see.
+    pub fn selection_bounds(&self) -> Option<(f32, f32)> {
+        let mut it = self.shapes.iter().filter(|s| s.ink == Ink::Select);
+        let first = it.next()?;
+        let (mut top, mut bottom) = (first.y, first.y + first.h);
+        for s in it {
+            top = top.min(s.y);
+            bottom = bottom.max(s.y + s.h);
+        }
+        Some((top, bottom))
     }
 }
 
@@ -1083,7 +1246,7 @@ mod tests {
 
     fn editing(src: &str, cursor: usize, width: f32) -> Laid {
         let d = parse(src);
-        lay_out(&d, width, 16.0, &Text::new(), Some(Editing { source: src, cursor }))
+        lay_out(&d, width, 16.0, &Text::new(), Some(Editing::at(src, cursor)))
     }
 
     #[test]
@@ -1590,7 +1753,7 @@ mod tests {
         // make: the byte under the pointer is the byte.
         let src = "# Heading\n";
         let t = Text::new();
-        let l = lay_out(&parse(src), 800.0, 16.0, &t, Some(Editing { source: src, cursor: 0 }));
+        let l = lay_out(&parse(src), 800.0, 16.0, &t, Some(Editing::at(src, 0)));
         let run = l.runs.first().expect("a run");
         let hit = l.hit(run.x + 0.5, run.baseline, &t).expect("hit");
         assert_eq!(hit, 0, "the start of the revealed source is byte 0");
@@ -1758,10 +1921,149 @@ mod tests {
         let text = Text::new();
         let src = "![alt](p.png)\n";
         let doc = with_picture(src, Art::Ready(stub(300, 200)));
-        let laid = lay_out(&doc, 900.0, 19.0, &text, Some(Editing { source: src, cursor: 3 }));
+        let laid = lay_out(&doc, 900.0, 19.0, &text, Some(Editing::at(src, 3)));
         let shown: String = laid.runs.iter().map(|r| r.text.as_str()).collect();
         assert!(shown.contains("![alt](p.png)"), "{shown:?}");
         assert!(laid.pictures.is_empty(), "the picture is still drawn under its own source");
     }
 
+
+    // ---- selection --------------------------------------------------------
+
+    /// Lay a document out with a selection over the given source bytes.
+    fn with_selection(src: &str, cursor: usize, a: usize, b: usize) -> Laid {
+        let e = Editing { source: src, cursor, reveal: a, selection: Some((a, b)) };
+        lay_out(&parse(src), 800.0, 16.0, &Text::new(), Some(e))
+    }
+
+    fn grounds(l: &Laid) -> Vec<&Shape> {
+        l.shapes.iter().filter(|s| s.ink == Ink::Select).collect()
+    }
+
+    #[test]
+    fn no_selection_draws_no_ground() {
+        let src = "hello world";
+        let l = lay_out(&parse(src), 800.0, 16.0, &Text::new(), Some(Editing::at(src, 0)));
+        assert!(grounds(&l).is_empty());
+    }
+
+    #[test]
+    fn a_selection_puts_a_ground_behind_the_text_it_covers() {
+        let src = "hello world";
+        let l = with_selection(src, 5, 0, 5);
+        let g = grounds(&l);
+        assert!(!g.is_empty(), "selected text got no ground");
+        // As wide as the words it covers and no wider.
+        let text = Text::new();
+        let run = l.runs.iter().find(|r| r.text.contains("hello")).expect("hello");
+        let total = text.width(run.face, &run.text, run.px);
+        let covered: f32 = g.iter().map(|s| s.w).sum();
+        assert!(covered > 0.0 && covered < total, "ground {covered} vs whole run {total}");
+    }
+
+    #[test]
+    fn a_selection_spanning_blocks_grounds_every_one_of_them() {
+        let src = "# Title\n\nA paragraph here.\n\nAnother one.\n";
+        let l = with_selection(src, src.len(), 0, src.len());
+        let lines: std::collections::BTreeSet<i64> =
+            grounds(&l).iter().map(|s| (s.y * 10.0) as i64).collect();
+        assert!(lines.len() >= 3, "expected a ground on each block, got {}", lines.len());
+    }
+
+    #[test]
+    fn a_selection_that_covers_nothing_on_screen_draws_nothing() {
+        // Past the last block -- trailing blank lines -- there is no text to
+        // show as taken, and inventing a band there would be a stripe in space.
+        let l = with_selection("hello\n", 6, 6, 7);
+        assert!(grounds(&l).is_empty());
+    }
+
+    #[test]
+    fn the_revealed_block_follows_the_reveal_byte_not_the_cursor() {
+        // What keeps the document still while a selection is dragged across it.
+        let src = "# One\n\n# Two\n";
+        let e = Editing { source: src, cursor: 9, reveal: 2, selection: Some((2, 9)) };
+        let l = lay_out(&parse(src), 800.0, 16.0, &Text::new(), Some(e));
+        let shown: String = l.runs.iter().map(|r| r.text.as_str()).collect();
+        assert!(shown.contains("# One"), "the anchor's block should show markdown: {shown:?}");
+        assert!(!shown.contains("# Two"), "the cursor's block should not: {shown:?}");
+    }
+
+    #[test]
+    fn a_ground_never_lands_inside_a_character() {
+        // The walk that places a ground steps by `len_utf8`, so a multibyte
+        // document is where an off-by-one would show up as a panic -- and this
+        // binary is built with `panic = "abort"`.
+        let src = "h\u{e9}llo w\u{f6}rld \u{fc}n\u{ef}code and more text to wrap a little\n";
+        for a in 0..src.len() {
+            for b in a..src.len() {
+                let _ = with_selection(src, b, a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn one_line_of_selection_is_one_height_whatever_faces_are_on_it() {
+        // Prose and `inline code` have different ascents, so squaring the line
+        // off is what stops the selection stepping up and down mid-sentence.
+        // The block is left RENDERED -- revealed, it would be all one mono face
+        // and the case would not arise.
+        let src = "prose with `code` in it\n";
+        let e = Editing { source: src, cursor: 0, reveal: src.len(), selection: Some((0, 23)) };
+        let l = lay_out(&parse(src), 800.0, 16.0, &Text::new(), Some(e));
+        let g = grounds(&l);
+        assert!(g.len() > 1, "expected several runs on one line, got {}", g.len());
+        let faces: Vec<Face> =
+            l.runs.iter().filter(|r| !r.text.is_empty()).map(|r| r.face).collect();
+        assert!(faces.iter().any(|f| *f != faces[0]), "the line is not mixed-face: {faces:?}");
+        for s in &g {
+            assert!((s.y - g[0].y).abs() < 0.01, "band tops differ: {} vs {}", s.y, g[0].y);
+            assert!((s.h - g[0].h).abs() < 0.01, "band heights differ: {} vs {}", s.h, g[0].h);
+        }
+    }
+
+    #[test]
+    fn a_selected_line_break_shows_past_the_end_of_the_line() {
+        // Otherwise several selected lines read as several selected words, with
+        // nothing to say the newlines between them were taken as well -- and they
+        // were, because they are what gets copied.
+        let src = "one\ntwo\n";
+        let text = Text::new();
+        let l = with_selection(src, 7, 0, 7);
+        let g = grounds(&l);
+        let top = g.iter().map(|s| (s.y * 10.0) as i64).min().expect("a band");
+        let first: Vec<_> = g.iter().filter(|s| (s.y * 10.0) as i64 == top).collect();
+        let run = l.runs.iter().find(|r| r.text.trim() == "one").expect("the run");
+        let right = first.iter().map(|s| s.x + s.w).fold(f32::MIN, f32::max);
+        let ink = run.x + text.width(run.face, run.text.trim_end(), run.px);
+        assert!(right > ink + 1.0, "the newline left no mark: {right} vs {ink}");
+    }
+
+    #[test]
+    fn the_last_line_of_a_selection_gets_no_trailing_mark() {
+        // The selection stops there, so there is no line break inside it to show.
+        let src = "one\ntwo\n";
+        let text = Text::new();
+        let l = with_selection(src, 7, 0, 7);
+        let g = grounds(&l);
+        let bottom = g.iter().map(|s| (s.y * 10.0) as i64).max().expect("a band");
+        let last: Vec<_> = g.iter().filter(|s| (s.y * 10.0) as i64 == bottom).collect();
+        let run = l.runs.iter().find(|r| r.text.trim() == "two").expect("the run");
+        let right = last.iter().map(|s| s.x + s.w).fold(f32::MIN, f32::max);
+        let ink = run.x + text.width(run.face, run.text.trim_end(), run.px);
+        assert!(right <= ink + 1.0, "a mark past the end of the selection: {right} vs {ink}");
+    }
+
+    #[test]
+    fn a_selection_reports_how_far_down_the_page_it_reaches() {
+        // What the view scrolls to follow when there is no caret to follow --
+        // which is every selection that leaves the block showing its markdown.
+        let src = "# One\n\n".to_string() + &"A paragraph here.\n\n".repeat(30);
+        let l = with_selection(&src, src.len(), 0, src.len());
+        let (top, bottom) = l.selection_bounds().expect("a selection covers text");
+        assert!(top < bottom, "empty bounds");
+        assert!(bottom > l.height / 2.0, "the bounds stop short of the selection");
+        let none = lay_out(&parse(&src), 800.0, 16.0, &Text::new(), Some(Editing::at(&src, 0)));
+        assert_eq!(none.selection_bounds(), None, "no selection, but bounds anyway");
+    }
 }

@@ -79,12 +79,23 @@ mdblaze --timing notes.md # and say where the milliseconds went
 | | |
 |---|---|
 | **click** | put the caret there — that block reveals its markdown |
+| **drag**, or **Shift** + a movement | select |
+| **Ctrl+C** / **Ctrl+X** / **Ctrl+V** | copy, cut, paste |
+| **Ctrl+A** | select the whole document |
 | **Ctrl+O** | open a file — or drop one on the window |
 | **Ctrl+S** | save, atomically. On an unnamed buffer it asks where |
 | **Ctrl+Z** / **Ctrl+Y** | undo, redo |
 | **Esc** | close — twice, quickly, to discard unsaved changes |
 
-Arrows, Home, End, PageUp and PageDown do what they do everywhere.
+Arrows, Home, End, PageUp and PageDown do what they do everywhere. On macOS,
+Command works everywhere Ctrl does.
+
+### What you copy is the markdown
+
+Select a rendered heading, paste it into a chat window, and you get `# Heading`
+— not the bare words. The file is the document and the rendering is a view of
+it, so copying takes what is actually written there. Anything else would quietly
+drop your formatting on the way out.
 
 ### Opening a file
 
@@ -152,8 +163,8 @@ true the moment somebody believes it, so it is written down.
 settled on. A document reader that asks you to configure your typography has
 failed at the one job it has.
 
-**No selection, no clipboard, no find.** Enough to fix a line. Not yet enough to
-restructure a document.
+**No find, no replace.** Enough to write and rearrange. Not yet enough to work
+through a long document looking for something.
 
 **One file.** If you want a vault, you want Obsidian, and it is very good.
 

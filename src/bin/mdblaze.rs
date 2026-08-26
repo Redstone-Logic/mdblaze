@@ -31,6 +31,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use mdblaze::clip::Clip;
 use mdblaze::desktop;
 use mdblaze::doc;
 use mdblaze::edit::Buffer;
@@ -76,6 +77,15 @@ const DISCARD_MS: u128 = 1_500;
 
 const BASE: f32 = mdblaze::text::BODY_PX;
 
+/// "s", unless there was exactly one of them.
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
 /// How the person asked to close, so the warning can name that gesture back to
 /// them rather than describing a different one.
 #[derive(Clone, Copy)]
@@ -111,6 +121,12 @@ struct App {
     /// Where the pointer is, in window coordinates. Kept because a click event
     /// does not carry a position -- only the move before it does.
     pointer: (f32, f32),
+    /// The system clipboard, not opened until the first copy or paste.
+    clip: Clip,
+    /// A left button is down: the selection is being dragged out. Set on press,
+    /// cleared on release, and the reason a pointer move is otherwise still just
+    /// a pointer move.
+    dragging: bool,
     note: Option<(String, Instant)>,
     /// When the discard bypass was armed, if it is. It expires after
     /// [`DISCARD_MS`], so closing unsaved work needs a SWIFT second press.
@@ -141,14 +157,70 @@ impl App {
         // Resolved here rather than in the parser, which does no IO on purpose:
         // it runs on every keystroke and is a pure function of the source.
         self.media.attach(&mut parsed);
+        // The block that shows its markdown follows the SELECTION'S ANCHOR when
+        // there is one, and the cursor otherwise. Revealing a block changes its
+        // height, so letting the cursor decide would re-reveal a different block
+        // on every pixel of a drag and shuffle the document under the pointer
+        // doing the selecting.
+        let selection = self.buffer.selection();
+        let reveal = self.buffer.anchor_byte().unwrap_or(cursor);
         self.laid = layout::lay_out(
             &parsed,
             width,
             BASE,
             &self.text,
-            Some(Editing { source: &source, cursor }),
+            Some(Editing { source: &source, cursor, reveal, selection }),
         );
         self.laid_for = width;
+    }
+
+    // ---- the clipboard ----------------------------------------------------
+    //
+    // What lands on the clipboard is the MARKDOWN, not what is on the screen.
+    // Selecting a rendered heading and pasting it elsewhere gives `# Heading`,
+    // because the file is the document and the rendering is a view of it -- and
+    // because anything else would silently drop the formatting on the way out.
+
+    fn copy(&mut self) {
+        match self.buffer.selected_text() {
+            Some(t) => {
+                let n = t.chars().count();
+                if self.clip.set(&t) {
+                    self.say(&format!("copied {n} character{}", plural(n)));
+                } else {
+                    self.say("no clipboard available");
+                }
+            }
+            None => self.say("nothing selected"),
+        }
+    }
+
+    fn cut(&mut self, now: u128) {
+        let Some(t) = self.buffer.selected_text() else {
+            self.say("nothing selected");
+            return;
+        };
+        let n = t.chars().count();
+        // The text only leaves the buffer once it is safely on the clipboard.
+        // Cutting into a clipboard that refused it would destroy the selection
+        // and leave nowhere to paste it back from.
+        if self.clip.set(&t) {
+            self.buffer.delete_selection(now);
+            self.say(&format!("cut {n} character{}", plural(n)));
+        } else {
+            self.say("no clipboard available \u{2014} nothing cut");
+        }
+    }
+
+    fn paste(&mut self, now: u128) {
+        match self.clip.get() {
+            Some(t) => {
+                let n = t.chars().count();
+                self.buffer.insert_str(&t, now);
+                self.say(&format!("pasted {n} character{}", plural(n)));
+            }
+            None => self.say("clipboard is empty"),
+        }
     }
 
     /// Ask the system for a path, without blocking the window.
@@ -296,12 +368,28 @@ impl App {
 
     /// Keep the caret on screen. Called after the layout that placed it.
     fn follow_caret(&mut self, height: f32) {
-        let Some(c) = self.laid.caret else { return };
+        // What the view has to keep looking at. Normally the caret -- but a
+        // selection that reaches outside the revealed block leaves no caret to
+        // follow, and then it is the selection's MOVING edge instead. Following
+        // the whole selection would be wrong: growing one downwards would scroll
+        // to its top and lose the end being dragged out.
+        let (top, bottom) = match self.laid.caret {
+            Some(c) => (c.top, c.top + c.height),
+            None => {
+                let Some((t, b)) = self.laid.selection_bounds() else { return };
+                let cursor = self.buffer.byte_offset();
+                match self.buffer.selection() {
+                    Some((_, hi)) if cursor == hi => (b - 1.0, b),
+                    Some(_) => (t, t + 1.0),
+                    None => return,
+                }
+            }
+        };
         let view = self.viewport(height);
-        if c.top < self.scroll {
-            self.scroll = c.top;
-        } else if c.top + c.height > self.scroll + view {
-            self.scroll = c.top + c.height - view;
+        if top < self.scroll {
+            self.scroll = top;
+        } else if bottom > self.scroll + view {
+            self.scroll = bottom - view;
         }
         self.scroll = self.scroll.clamp(0.0, self.max_scroll(height));
     }
@@ -398,7 +486,11 @@ impl ApplicationHandler<Chosen> for App {
 
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let size = window.inner_size();
-                let ctrl = self.mods.state().control_key();
+                // Command on macOS, Control everywhere else -- and Control on
+                // macOS too, because a terminal-shaped person there presses it
+                // out of habit and nothing else in this window wants the chord.
+                let ctrl = self.mods.state().control_key()
+                    || (cfg!(target_os = "macos") && self.mods.state().super_key());
                 let shift = self.mods.state().shift_key();
                 let now = self.ms();
                 let page = self.viewport(size.height as f32) * 0.9;
@@ -408,6 +500,29 @@ impl ApplicationHandler<Chosen> for App {
                 // caret.
                 let mut touched = true;
 
+                // Shift plus a movement grows a selection, and the same movement
+                // without it drops one. Done here rather than in each arm below,
+                // so every movement key extends a selection without knowing that
+                // selections exist -- and so does the next one added.
+                //
+                // Paging is deliberately not in the list: it scrolls without
+                // moving the caret, so there is nothing for it to extend.
+                if !ctrl
+                    && matches!(
+                        &event.logical_key,
+                        Key::Named(
+                            NamedKey::ArrowLeft
+                                | NamedKey::ArrowRight
+                                | NamedKey::ArrowUp
+                                | NamedKey::ArrowDown
+                                | NamedKey::Home
+                                | NamedKey::End
+                        )
+                    )
+                {
+                    self.buffer.extend(shift);
+                }
+
                 match &event.logical_key {
                     Key::Character(c) if ctrl && c.eq_ignore_ascii_case("o") => {
                         self.ask(Intent::Open);
@@ -416,6 +531,19 @@ impl ApplicationHandler<Chosen> for App {
                     Key::Character(c) if ctrl && c.eq_ignore_ascii_case("s") => {
                         self.save();
                         touched = false;
+                    }
+                    Key::Character(c) if ctrl && c.eq_ignore_ascii_case("c") => {
+                        self.copy();
+                        touched = false;
+                    }
+                    Key::Character(c) if ctrl && c.eq_ignore_ascii_case("x") => {
+                        self.cut(now);
+                    }
+                    Key::Character(c) if ctrl && c.eq_ignore_ascii_case("v") => {
+                        self.paste(now);
+                    }
+                    Key::Character(c) if ctrl && c.eq_ignore_ascii_case("a") => {
+                        self.buffer.select_all();
                     }
                     Key::Character(c) if ctrl && c.eq_ignore_ascii_case("z") => {
                         let moved = if shift { self.buffer.redo() } else { self.buffer.undo() };
@@ -496,6 +624,21 @@ impl ApplicationHandler<Chosen> for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer = (position.x as f32, position.y as f32);
+                // Dragging with the button down sweeps out a selection. The
+                // anchor was left where the press landed, so `extend(true)` finds
+                // it already there and this only has to move the cursor end.
+                if self.dragging {
+                    let size = window.inner_size();
+                    let (x, y) = (self.pointer.0, self.pointer.1 + self.scroll);
+                    if let Some(byte) = self.laid.hit(x, y, &self.text) {
+                        if byte != self.buffer.byte_offset() {
+                            self.buffer.extend(true);
+                            self.buffer.set_byte_offset(byte);
+                            self.reflow(size.width as f32);
+                            window.request_redraw();
+                        }
+                    }
+                }
             }
 
             WindowEvent::MouseInput { state, button, .. }
@@ -508,13 +651,24 @@ impl ApplicationHandler<Chosen> for App {
                 // A click below the last line is a click at the end, which is
                 // what dragging past the bottom of a document means.
                 if let Some(byte) = self.laid.hit(x, y, &self.text) {
+                    // Shift+click reaches from where the caret already is, the
+                    // way it does in every other editor; a plain press drops any
+                    // selection and starts a new one here.
+                    self.buffer.extend(self.mods.state().shift_key());
                     self.buffer.set_byte_offset(byte);
+                    self.dragging = true;
                     // The block under the caret changed, so what is revealed did
                     // too -- the click changes the picture even though it changed
                     // no text.
                     self.reflow(size.width as f32);
                     window.request_redraw();
                 }
+            }
+
+            WindowEvent::MouseInput { state, button, .. }
+                if state == ElementState::Released && button == MouseButton::Left =>
+            {
+                self.dragging = false;
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
@@ -607,6 +761,7 @@ fn main() {
     let mut shot_to: Option<std::path::PathBuf> = None;
     let mut want_shot = false;
     let mut shot_cursor: Option<usize> = None;
+    let mut shot_selection: Option<(usize, usize)> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -624,6 +779,15 @@ fn main() {
             // Where to put the caret for a shot, as a byte offset. What makes the
             // live-reveal visible in a still image.
             "--at" => shot_cursor = args.next().and_then(|v| v.parse().ok()),
+            // Which source bytes to show as selected, as `START:END`. The other
+            // half of `--at`: a selection is drawn by the layout, so this is the
+            // only way to LOOK at one without a person at the keyboard.
+            "--select" => {
+                shot_selection = args.next().and_then(|v| {
+                    let (a, b) = v.split_once(':')?;
+                    Some((a.parse().ok()?, b.parse().ok()?))
+                })
+            }
             // Register as the handler for markdown, so double-clicking a .md
             // opens this. Separated from opening a file because it changes the
             // machine rather than the document, and because taking over a file
@@ -638,7 +802,7 @@ fn main() {
             }
             "-h" | "--help" => {
                 println!(
-                    "mdblaze [--timing] [--once] [--shot out.ppm [--at BYTE]] <file.md>\n\
+                    "mdblaze [--timing] [--once] [--shot out.ppm [--at B] [--select A:B]] <file.md>\n\
                      mdblaze --install-handler     open .md files by double-click\n\
                      mdblaze --uninstall-handler   and give the association back"
                 );
@@ -694,7 +858,14 @@ fn main() {
         let (w, h) = (900usize, 1100usize);
         let mut text2 = Text::new();
         let mut buf = vec![0u32; w * h];
-        let editing = shot_cursor.map(|cursor| Editing { source: &source, cursor });
+        let editing = shot_cursor.map(|cursor| Editing {
+            source: &source,
+            cursor,
+            // The anchor decides the reveal, exactly as it does when a person is
+            // dragging, so a shot shows what they would be looking at.
+            reveal: shot_selection.map(|(a, _)| a).unwrap_or(cursor),
+            selection: shot_selection,
+        });
         let laid = layout::lay_out(&parsed, w as f32, BASE, &text2, editing);
         render::draw(&laid, &mut text2, &mut Scaled::default(), &mut buf, w, h, 0.0, &Theme::DARK);
         render::draw_status(
@@ -754,6 +925,8 @@ fn main() {
         scroll: 0.0,
         mods: Modifiers::default(),
         pointer: (0.0, 0.0),
+        clip: Clip::new(),
+        dragging: false,
         note: None,
         armed_at: None,
         timing,

@@ -31,12 +31,14 @@ pub struct Theme {
     pub caret: u32,
     /// The status bar while unsaved work is one keypress from being discarded.
     pub alarm_bg: u32,
-    /// The highlighted row in the file listing.
+    /// The ground behind selected text.
     ///
     /// Its own token rather than reusing the caret's crimson: the caret is a
     /// two-pixel line and reads as an accent, while the same colour across a
-    /// whole row reads as an alarm. This is the accent with most of the
-    /// saturation taken out, so it says "here" without saying "careful".
+    /// whole paragraph reads as an alarm. This is the accent with most of the
+    /// saturation taken out, so it says "here" without saying "careful". Dark
+    /// enough that body text keeps its contrast on top of it, which is why the
+    /// selection does not also change the colour of the text it covers.
     pub select: u32,
 }
 
@@ -72,6 +74,7 @@ impl Theme {
             Ink::Dim => self.dim,
             Ink::Link => self.link,
             Ink::Code => self.code,
+            Ink::Select => self.select,
             Ink::Keyword => self.keyword,
             Ink::Str => self.string,
             Ink::Number => self.number,
@@ -283,10 +286,19 @@ pub fn draw(
 
     // Shapes first: they are grounds and rules, and text sits on them.
     for s in &laid.shapes {
+        // Both EDGES are rounded, rather than rounding the origin and adding a
+        // rounded size to it. Those differ by a pixel about half the time, and
+        // where two shapes abut -- which is every selection that covers a line
+        // holding more than one run -- the difference is a one-pixel stripe of
+        // background between them. Rounding the edges makes the right edge of one
+        // shape land exactly where the left edge of the next one does.
+        //
+        // Each side still gets a pixel of its own when it rounds to nothing, so a
+        // hairline rule does not vanish.
         let y0 = (s.y - scroll).round() as i64;
-        let y1 = y0 + s.h.round().max(1.0) as i64;
+        let y1 = ((s.y - scroll + s.h).round() as i64).max(y0 + 1);
         let x0 = s.x.round() as i64;
-        let x1 = x0 + s.w.round().max(1.0) as i64;
+        let x1 = ((s.x + s.w).round() as i64).max(x0 + 1);
         let colour = match s.ink {
             Ink::Code => theme.code_bg,
             other => theme.of(other),
@@ -507,7 +519,7 @@ mod tests {
         let d = parse(src);
         let laid = lay_out(
             &d, w as f32, 16.0, &text,
-            Some(crate::layout::Editing { source: src, cursor: 3 }),
+            Some(crate::layout::Editing::at(src, 3)),
         );
         assert!(laid.caret.is_some(), "the layout produced no caret to draw");
         let mut buf = vec![0u32; w * h];
@@ -765,5 +777,51 @@ mod tests {
             r.abs_diff(g) > 40 && !known.contains(p)
         });
         assert!(coloured.count() > 20, "the rocket came out in the text colour");
+    }
+
+    #[test]
+    fn two_shapes_that_abut_leave_no_stripe_of_background_between_them() {
+        // Rounding the origin and adding a rounded size to it puts the right edge
+        // of one shape a pixel short of the left edge of the next about half the
+        // time, and the background shows through the join. Every selection that
+        // covers a line holding more than one run is that case.
+        use crate::layout::{Ink, Shape};
+        let (w, h) = (200usize, 40usize);
+        let mut text = Text::new();
+        let mut buf = vec![0u32; w * h];
+        for x in 0..40 {
+            // A tenth of a pixel at a time, so every rounding case is covered.
+            let a = 10.0 + x as f32 * 0.1;
+            let laid = Laid {
+                shapes: vec![
+                    Shape { x: a, y: 10.0, w: 33.3, h: 10.0, ink: Ink::Select },
+                    Shape { x: a + 33.3, y: 10.0, w: 27.7, h: 10.0, ink: Ink::Select },
+                ],
+                ..Default::default()
+            };
+            buf.fill(0);
+            draw(&laid, &mut text, &mut Scaled::default(), &mut buf, w, h, 0.0, &Theme::DARK);
+            let row = &buf[15 * w..16 * w];
+            let first = row.iter().position(|p| *p == Theme::DARK.select).expect("no ground");
+            let last = row.iter().rposition(|p| *p == Theme::DARK.select).expect("no ground");
+            let hole = row[first..=last].iter().any(|p| *p != Theme::DARK.select);
+            assert!(!hole, "a gap between two abutting shapes at x={a}");
+        }
+    }
+
+    #[test]
+    fn a_shape_too_thin_to_round_to_a_pixel_is_still_drawn() {
+        // What the `.max` on each edge is for: a hairline rule that rounds to
+        // nothing must not disappear.
+        use crate::layout::{Ink, Shape};
+        let (w, h) = (60usize, 20usize);
+        let mut text = Text::new();
+        let mut buf = vec![0u32; w * h];
+        let laid = Laid {
+            shapes: vec![Shape { x: 10.0, y: 10.0, w: 30.0, h: 0.2, ink: Ink::Select }],
+            ..Default::default()
+        };
+        draw(&laid, &mut text, &mut Scaled::default(), &mut buf, w, h, 0.0, &Theme::DARK);
+        assert!(buf.contains(&Theme::DARK.select), "a hairline rule vanished");
     }
 }
