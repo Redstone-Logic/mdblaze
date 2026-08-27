@@ -207,14 +207,22 @@ git tag -a v0.2.1 -m "what changed"
 git push origin v0.2.1
 ```
 
-The tag builds the four binaries, cuts the GitHub release and publishes the
-crate, in that order, with the irreversible step last. A gate job runs first and
-refuses a tag that disagrees with `Cargo.toml`, then proves the packaged crate
-compiles — so a bad `exclude` list is caught before anything is published rather
-than after. **No crates.io API token exists anywhere in
-this repository or its secrets**: the publishing job asks GitHub for an OIDC
-token, crates.io trades it for one of its own that lasts minutes, and it is
-revoked when the job ends.
+That one push runs the whole thing, in an order chosen so that everything able
+to say *don't release this* says it before anything is published:
+
+1. the tag agrees with `Cargo.toml`, and the packaged crate compiles — so a bad
+   `exclude` list is caught here rather than after the release is public
+2. the tests, on Linux, macOS and Windows, **on the commit being tagged**
+3. the four binaries
+4. the GitHub release
+5. crates.io — last, because it is the only step that cannot be undone
+
+Publishing uses a `CARGO_REGISTRY_TOKEN` repository secret, scoped on crates.io
+to `publish-update` on this crate alone. It is read by one step, which runs no
+third-party code: `cargo publish` normally verifies by *building*, and a build
+executes the build scripts and proc macros of every dependency. The tarball was
+already built and proven in step 1, so the publishing step passes `--no-verify`
+and the token never enters a build environment.
 
 ## Building
 

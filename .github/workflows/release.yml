@@ -1,7 +1,8 @@
 name: Release
 
-# Tag-driven. `git tag v0.2.0 && git push origin v0.2.0` is the whole ritual:
-# it builds the four binaries, cuts the GitHub release, and publishes the crate.
+# Tag-driven. `git tag -a v0.2.0 && git push origin v0.2.0` is the whole ritual:
+# it checks, tests, builds the four binaries, cuts the GitHub release, and
+# publishes the crate -- in that order, with the irreversible step last.
 on:
   push:
     tags: ["v*"]
@@ -59,8 +60,18 @@ jobs:
       - name: the packaged crate compiles
         run: cargo package --locked
 
-  build:
+  # The tests, on all three platforms, on the commit being released -- not on
+  # whatever ran earlier for some other reason. `ci.yml` itself, called, so there
+  # is one definition of "tested" and it cannot drift from what pull requests are
+  # held to.
+  test:
     needs: check-version
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  build:
+    needs: test
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.container || '' }}
@@ -180,23 +191,23 @@ jobs:
   # version number is spent forever. So it happens only once every reversible
   # thing has already succeeded.
   #
-  # No API token is stored for this, here or in the repository's secrets. The
-  # job asks GitHub for an OIDC token, crates.io trades that for one of its own
-  # that lasts minutes, and the action revokes it when the job ends. crates.io
-  # decides whether to make that trade from the Trusted Publishing configuration
-  # on the crate itself, which names this repository and this filename -- so
-  # RENAMING THIS FILE breaks publishing until the configuration is updated to
-  # match.
+  # The credential is `CARGO_REGISTRY_TOKEN` in this repository's secrets. Give it
+  # the NARROWEST scope crates.io offers for the job: endpoint `publish-update`,
+  # restricted to the crate `mdblaze`. So scoped, it can do exactly one thing --
+  # put up a new version of this crate -- and nothing else on the account: not a
+  # new crate, not a yank, not an ownership change.
+  #
+  # It is read in ONE step, the last one, and that step runs no third-party code.
+  # See the `--no-verify` note below for why that matters.
   crates-io:
     needs: release
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
-      # BOTH of these, and the second one is not optional padding. Naming any
-      # permission at job level REPLACES the workflow's block rather than adding
-      # to it, and everything left out becomes `none` -- so writing `id-token`
-      # alone silently takes the checkout's repository access away with it.
-      id-token: write
+      # Naming any permission at job level REPLACES the workflow's block rather
+      # than adding to it, and everything left out becomes `none`. This job reads
+      # the repository and writes nothing, so that is all it gets -- the
+      # workflow-wide `contents: write` the release job needs does not reach it.
       contents: read
     steps:
       - uses: actions/checkout@v4
@@ -241,12 +252,18 @@ jobs:
               ;;
           esac
 
-      # `@v1` is a moving BRANCH in that repository, not a tag -- there is no `v1`
-      # tag, only `v1.0.x` -- so this follows their v1 line the same way
-      # `dtolnay/rust-toolchain@stable` follows Rust's.
-      - uses: rust-lang/crates-io-auth-action@v1
-        id: auth
+      # A missing secret should say so, rather than reaching cargo and coming back
+      # as an authentication failure that reads like the token is wrong.
+      - name: the token exists
         if: steps.published.outputs.skip == 'false'
+        env:
+          TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          [ -n "$TOKEN" ] || {
+            echo "::error::CARGO_REGISTRY_TOKEN is not set in this repository's secrets."
+            echo "::error::Settings -> Secrets and variables -> Actions -> New repository secret."
+            exit 1
+          }
 
       # `--no-verify` because the gate job ALREADY built this exact tarball, from
       # this exact commit, and proved it compiles. Verified byte-for-byte: with
@@ -258,10 +275,14 @@ jobs:
       # in their environment. Skipping the rebuild means no third-party code runs
       # anywhere near the credential.
       #
+      # That mattered when the token lasted thirty minutes. It matters MORE now
+      # that it is a long-lived secret: a build script that read it would hold
+      # publishing rights to this crate until somebody noticed and revoked it.
+      #
       # `--locked` so the tarball is cut from the same dependency versions the
       # binaries were tested against, not whatever has been released since.
       - name: cargo publish
         if: steps.published.outputs.skip == 'false'
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --locked --no-verify

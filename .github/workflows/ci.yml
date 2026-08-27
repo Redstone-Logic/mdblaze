@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Callable, so the release pipeline runs THESE tests rather than a second copy
+  # of them that can drift. A release must not be able to ship something the
+  # tests never saw, and "CI probably ran on this commit earlier" is not the same
+  # promise as "the tests passed on the commit being released".
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
