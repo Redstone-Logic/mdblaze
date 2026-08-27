@@ -161,6 +161,16 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    permissions:
+      # `contents` to create the release. `id-token` and `attestations` are what
+      # `attest-build-provenance` needs, and neither is a stored credential: the
+      # signing identity IS this workflow's OIDC identity, so there is nothing to
+      # keep in secrets and nothing to leak or rotate. This is a different thing
+      # from the publishing token, which stays a secret because a registry
+      # credential is a credential.
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -176,14 +186,84 @@ jobs:
           sha256sum *.tar.gz *.zip > SHA256SUMS
           cat SHA256SUMS
 
+      # What a checksum file cannot do on its own: say who made it.
+      #
+      # SHA256SUMS proves an archive was not altered in transit. It proves
+      # nothing about where it came from -- anyone can build a different binary
+      # and publish a matching checksum beside it. An attestation is signed by
+      # GitHub against this workflow's own identity and recorded in a public
+      # transparency log, so `gh attestation verify` answers the question the
+      # checksum cannot: this archive was built by THIS workflow, from THIS
+      # repository, at THIS commit.
+      #
+      # Free, keyless, and no use whatsoever against Gatekeeper or SmartScreen --
+      # those want a certificate from Apple or a CA, which is a separate thing
+      # with a separate bill. This is provenance, not code signing.
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+
+      # A detached OpenPGP signature over the checksum file, for the platform
+      # with no notion of a trusted publisher at all. Linux has no Gatekeeper to
+      # satisfy; what it has is a convention -- a `.asc` beside the sums and a
+      # key people can fetch once -- which is how every distribution has shipped
+      # for thirty years.
+      #
+      # Inert until the key exists, so the pipeline works today and starts
+      # signing the moment it is given something to sign with.
+      - name: is there a signing key?
+        id: gpg
+        env:
+          KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          if [ -n "$KEY" ]; then
+            echo "have=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::GPG_PRIVATE_KEY is not set; SHA256SUMS will not be signed"
+            echo "have=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: sign the checksums
+        if: steps.gpg.outputs.have == 'true'
+        env:
+          KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -eu
+          # A throwaway keyring in the runner's own temp directory, never the
+          # default one, so nothing is left behind for a later step to pick up.
+          export GNUPGHOME
+          GNUPGHOME=$(mktemp -d)
+          chmod 700 "$GNUPGHOME"
+          printf '%s' "$KEY" | gpg --batch --quiet --import
+          key=$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/ {print $5; exit}')
+          echo "signing with $key"
+          printf '%s' "$PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback \
+            --passphrase-fd 0 --local-user "$key" \
+            --armor --detach-sign --output dist/SHA256SUMS.asc dist/SHA256SUMS
+          # Prove the signature verifies before it goes anywhere near a release.
+          gpg --verify dist/SHA256SUMS.asc dist/SHA256SUMS
+          rm -rf "$GNUPGHOME"
+
       - name: publish
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -eu
+          # Built as a list rather than a glob with a fallback: the signature is
+          # only there when a key was configured, and a second `gh release
+          # create` behind an `||` would also fire on failures that have nothing
+          # to do with a missing file.
+          assets=(dist/*.tar.gz dist/*.zip dist/SHA256SUMS)
+          if [ -f dist/SHA256SUMS.asc ]; then assets+=(dist/SHA256SUMS.asc); fi
+          printf 'releasing %s\n' "${assets[@]}"
           gh release create "${GITHUB_REF#refs/tags/}" \
             --title "${GITHUB_REF#refs/tags/}" \
             --generate-notes \
-            dist/*.tar.gz dist/*.zip dist/SHA256SUMS
+            "${assets[@]}"
 
   # LAST, deliberately. Everything above this can be done again: a tag can be
   # moved, a GitHub release deleted and recut. A crates.io version cannot -- it

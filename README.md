@@ -190,11 +190,20 @@ found` and stops there. Built in bookworm the floor is **glibc 2.34**, verified
 running on Debian 12, Ubuntu 22.04 and Rocky 9. Debian 11 is the first release it
 does not reach.
 
-The binaries are not code-signed. macOS refuses a downloaded one until the
-quarantine flag is off it — `xattr -d com.apple.quarantine mdblaze` — and Windows
-SmartScreen warns the first time. A signing certificate is a yearly bill, this
-program is free, and the `SHA256SUMS` file is there so you can check you got what
-CI built rather than take anyone's word for it.
+### Checking what you downloaded
+
+`SHA256SUMS` tells you an archive arrived intact. It cannot tell you who built
+it — anyone can publish a binary and a matching checksum beside it. So every
+archive also carries a **build attestation**, signed by GitHub against the
+release workflow's own identity and recorded in a public transparency log:
+
+```sh
+gh attestation verify mdblaze-linux-x86_64.tar.gz --repo Redstone-Logic/mdblaze
+```
+
+That answers the question a checksum cannot — this archive was built by that
+workflow, from this repository, at a named commit — and it needs no key from us
+and no trust in this page.
 
 Each archive carries the licences with it, because the Noto faces compiled into
 the binary are under the SIL Open Font License and that text has to travel with
