@@ -127,6 +127,11 @@ jobs:
       # CI, and this is Microsoft's own answer to that -- the key stays in their
       # HSM and the runner never holds it.
       #
+      # The three Azure values below are `vars`, not `secrets`: an endpoint, an
+      # account name and a profile name are configuration, not credentials, and
+      # the code signing SOP holds them as ORGANIZATION variables beside the
+      # organization secrets.
+      #
       # Inert without credentials, like every other signing step here.
       - name: are there signing credentials?
         id: winsign
@@ -149,9 +154,9 @@ jobs:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
           azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
-          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
-          trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
-          certificate-profile-name: ${{ secrets.AZURE_CERT_PROFILE }}
+          endpoint: ${{ vars.TRUSTED_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ vars.TRUSTED_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.TRUSTED_SIGNING_PROFILE }}
           files: ${{ github.workspace }}\target\${{ matrix.target }}\release\mdblaze.exe
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
@@ -209,6 +214,12 @@ jobs:
   # Every signing step is inert without credentials. No certificate means a
   # warning and an unsigned build, not a failed one, so the pipeline works today
   # and starts signing the day it is given something to sign with.
+  #
+  # The secret NAMES are not chosen here. They come from the Wahle-Tec code
+  # signing SOP, which buys each platform identity once and stores its credentials
+  # once, at the GitHub organization level, for every package that ships a binary.
+  # Inventing names for this repository would mean minting a second copy of the
+  # same secret, and the two would drift the first time one was rotated.
   macos:
     needs: test
     runs-on: macos-latest
@@ -247,20 +258,20 @@ jobs:
       - name: are there signing credentials?
         id: creds
         env:
-          CERT: ${{ secrets.APPLE_CERT_P12 }}
+          CERT: ${{ secrets.APPLE_CERTIFICATE }}
         run: |
           if [ -n "$CERT" ]; then
             echo "have=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::APPLE_CERT_P12 is not set; the macOS build will be unsigned and macOS will quarantine it"
+            echo "::warning::APPLE_CERTIFICATE is not set; the macOS build will be unsigned and macOS will quarantine it"
             echo "have=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: a keychain holding the certificate
         if: steps.creds.outputs.have == 'true'
         env:
-          CERT: ${{ secrets.APPLE_CERT_P12 }}
-          CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          CERT: ${{ secrets.APPLE_CERTIFICATE }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         run: |
           set -eu
           # A keychain belonging to this run, with a password nobody chose,
