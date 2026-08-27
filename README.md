@@ -179,9 +179,18 @@ which needs a different renderer.
 
 ## Releases
 
-Prebuilt binaries for Linux, macOS (Apple silicon and Intel) and Windows are on
-the [releases page](https://github.com/Redstone-Logic/mdblaze/releases), with a
+Prebuilt binaries are on the
+[releases page](https://github.com/Redstone-Logic/mdblaze/releases), with a
 `SHA256SUMS` alongside them.
+
+| | |
+|---|---|
+| **macOS** | `mdblaze-macos.dmg` — open it, drag to Applications. Signed with a Developer ID, notarized by Apple, and the ticket stapled into the image, so it opens with no warning and needs no network to prove it. One **universal** binary inside: Apple silicon and Intel, no choice to make. |
+| **Windows** | `mdblaze-windows-x86_64.zip`, Authenticode signed, so Windows names the publisher instead of warning about an unknown one. |
+| **Linux** | `mdblaze-linux-x86_64.tar.gz`. No signing here because Linux has no equivalent to satisfy — instead `SHA256SUMS.asc`, a detached OpenPGP signature. |
+
+There is a macOS tarball too, `mdblaze-macos-universal.tar.gz`, holding the same
+signed binary for anyone who wants it on `PATH` rather than in Applications.
 
 The Linux build is made inside Debian 12 on purpose. A binary demands the glibc
 it was linked against, so one built on a current CI image refuses to load on most

@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 /// Read only by the installer, which runs on macOS -- but the tests below check
 /// the bytes are a real container on every platform, because a truncated icon
 /// produces an application with no icon and no error saying why.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(unix), allow(dead_code))]
 const ICNS: &[u8] = include_bytes!("../../assets/icon.icns");
 
 /// The Uniform Type Identifier for markdown.
@@ -153,6 +153,52 @@ pub fn bundle_path(name: &str) -> PathBuf {
     super::home().join("Applications").join(format!("{name}.app"))
 }
 
+/// Lay out an empty bundle: the directories, the plist and the icon.
+///
+/// Everything both callers below need, and nothing either of them differs on.
+/// Answers the `Contents/MacOS` directory, which is where the program goes and
+/// is the only thing they disagree about.
+#[cfg(unix)]
+fn skeleton(app: &Path) -> std::io::Result<PathBuf> {
+    let macos_dir = app.join("Contents/MacOS");
+    std::fs::create_dir_all(&macos_dir)?;
+    std::fs::write(app.join("Contents/Info.plist"), plist(NAME))?;
+    let resources = app.join("Contents/Resources");
+    std::fs::create_dir_all(&resources)?;
+    std::fs::write(resources.join(format!("{ICON_FILE}.icns")), ICNS)?;
+    Ok(macos_dir)
+}
+
+/// Build a SELF-CONTAINED bundle at `app`, with `exec` copied inside it.
+///
+/// The other kind of bundle this module makes -- the one `--install-handler`
+/// writes -- holds a [`trampoline`] instead, a script that runs the binary
+/// wherever it already lives, so that upgrading in place keeps working. That is
+/// right for a bundle on the machine that built it and wrong for every other
+/// purpose: a script pointing at `/Users/somebody/.cargo/bin` is not an
+/// application, it is a bookmark, and it cannot be signed, notarized or handed
+/// to anyone.
+///
+/// This is what a release ships. It carries its own program, so it can be code
+/// signed as one thing, notarized as one thing, and dragged to Applications by
+/// somebody who has never heard of cargo.
+#[cfg(unix)]
+pub fn bundle(app: &Path, exec: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Start from nothing. Copying over a bundle left from a previous run would
+    // leave that run's files in place beside this one's -- and on macOS a single
+    // unexpected file inside a bundle invalidates its signature.
+    if app.exists() {
+        std::fs::remove_dir_all(app)?;
+    }
+    let macos_dir = skeleton(app)?;
+    let dest = macos_dir.join(NAME);
+    std::fs::copy(exec, &dest)?;
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 pub(super) fn install() -> std::io::Result<Vec<String>> {
     use std::os::unix::fs::PermissionsExt;
@@ -171,14 +217,7 @@ pub(super) fn install() -> std::io::Result<Vec<String>> {
     }
 
     let app = bundle_path(NAME);
-    let macos_dir = app.join("Contents/MacOS");
-    std::fs::create_dir_all(&macos_dir)?;
-    std::fs::write(app.join("Contents/Info.plist"), plist(NAME))?;
-
-    // The same icon the other two platforms use, in the container macOS reads.
-    let resources = app.join("Contents/Resources");
-    std::fs::create_dir_all(&resources)?;
-    std::fs::write(resources.join(format!("{ICON_FILE}.icns")), ICNS)?;
+    let macos_dir = skeleton(&app)?;
 
     let launcher = macos_dir.join(NAME);
     std::fs::write(&launcher, trampoline(&exe))?;
@@ -312,5 +351,69 @@ mod tests {
         let tail: Vec<_> = p.components().rev().take(2).collect();
         assert_eq!(tail[0].as_os_str(), "mdblaze.app");
         assert_eq!(tail[1].as_os_str(), "Applications");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shipped_bundle_carries_its_own_program() {
+        // The distinction this whole function exists for: what `--install-handler`
+        // writes points AT a binary, and what a release ships CONTAINS one. A
+        // bundle that points at a path on the machine that built it cannot be
+        // signed, notarized, or given to anybody.
+        let dir = std::env::temp_dir().join(format!("mdblaze-bundle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let exe = dir.join("pretend-binary");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(&exe, b"\x7fELF not really").expect("write");
+
+        let app = dir.join("mdblaze.app");
+        bundle(&app, &exe).expect("bundle");
+
+        let program = app.join("Contents/MacOS").join(NAME);
+        assert_eq!(std::fs::read(&program).expect("program"), b"\x7fELF not really");
+        assert!(app.join("Contents/Info.plist").exists(), "no plist");
+        assert!(
+            app.join("Contents/Resources").join(format!("{ICON_FILE}.icns")).exists(),
+            "no icon"
+        );
+
+        // Not a script. If this ever became a trampoline again, signing would
+        // still succeed and the application would be broken on every machine but
+        // the one that built it.
+        let bytes = std::fs::read(&program).expect("program");
+        assert!(!bytes.starts_with(b"#!"), "the bundle holds a script, not a program");
+
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&program).expect("stat").permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "the program is not executable: {mode:o}");
+        }
+
+        // Building over an existing bundle must not leave the old contents
+        // behind: on macOS one unexpected file inside a bundle invalidates its
+        // signature.
+        std::fs::write(app.join("Contents/stowaway"), b"x").expect("write");
+        bundle(&app, &exe).expect("rebundle");
+        assert!(!app.join("Contents/stowaway").exists(), "a previous build survived");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shipped_bundle_and_an_installed_one_agree_on_the_plist() {
+        // Two ways of building a bundle, one description of what it is. If these
+        // ever drift, a signed release would declare something different from
+        // what `--install-handler` declares on the same machine.
+        let dir = std::env::temp_dir().join(format!("mdblaze-plist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let exe = dir.join("x");
+        std::fs::write(&exe, b"x").expect("write");
+        let app = dir.join("a.app");
+        bundle(&app, &exe).expect("bundle");
+        let written = std::fs::read_to_string(app.join("Contents/Info.plist")).expect("plist");
+        assert_eq!(written, plist(NAME));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

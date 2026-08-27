@@ -99,12 +99,6 @@ jobs:
             os: ubuntu-latest
             container: rust:1-bookworm
             target: x86_64-unknown-linux-gnu
-          - name: macos-arm64
-            os: macos-latest
-            target: aarch64-apple-darwin
-          - name: macos-x86_64
-            os: macos-latest
-            target: x86_64-apple-darwin
           - name: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -125,6 +119,54 @@ jobs:
           apt-get install -y libxkbcommon-dev libwayland-dev libxkbcommon-x11-dev
 
       - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Authenticode, so Windows names a publisher instead of warning that this
+      # came from an unknown one. Azure Artifact Signing rather than a bought
+      # certificate: since 2023 a publicly trusted code signing certificate has
+      # to live on a hardware token or an HSM, which is close to unworkable in
+      # CI, and this is Microsoft's own answer to that -- the key stays in their
+      # HSM and the runner never holds it.
+      #
+      # Inert without credentials, like every other signing step here.
+      - name: are there signing credentials?
+        id: winsign
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+        run: |
+          if [ -n "$CLIENT_ID" ]; then
+            echo "have=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::AZURE_CLIENT_ID is not set; mdblaze.exe will be unsigned and SmartScreen will warn"
+            echo "have=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: sign mdblaze.exe
+        if: runner.os == 'Windows' && steps.winsign.outputs.have == 'true'
+        uses: Azure/trusted-signing-action@v2
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_CERT_PROFILE }}
+          files: ${{ github.workspace }}\target\${{ matrix.target }}\release\mdblaze.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # Proof it took, rather than a green step that signed nothing. `signtool`
+      # is on the runner image as part of the Windows SDK.
+      - name: the signature verifies
+        if: runner.os == 'Windows' && steps.winsign.outputs.have == 'true'
+        shell: pwsh
+        run: |
+          $exe = "target/${{ matrix.target }}/release/mdblaze.exe"
+          $sig = Get-AuthenticodeSignature $exe
+          $sig | Format-List
+          if ($sig.Status -ne 'Valid') { throw "signature is $($sig.Status)" }
 
       # A tarball on Unix and a zip on Windows, each carrying the licences --
       # the Noto faces inside the binary are OFL and that text has to travel
@@ -157,8 +199,169 @@ jobs:
             dist/*.zip
           if-no-files-found: error
 
+
+  # macOS gets a job of its own rather than two rows in the matrix above, because
+  # what ships is ONE artifact: a universal binary, inside a bundle, inside a disk
+  # image, signed and notarized and stapled as a single thing. Two rows on two
+  # runners cannot `lipo` anything together, and it would mean two trips to Apple
+  # for one release.
+  #
+  # Every signing step is inert without credentials. No certificate means a
+  # warning and an unsigned build, not a failed one, so the pipeline works today
+  # and starts signing the day it is given something to sign with.
+  macos:
+    needs: test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - name: build both architectures
+        run: |
+          set -eu
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+      # One binary that runs on both. `lipo` is Apple's own tool for it, and the
+      # result is what Mac software has shipped since the PowerPC transition. It
+      # ends the "which download do I need?" question, which is not a question a
+      # text editor should be asking anybody.
+      - name: one universal binary
+        run: |
+          set -eu
+          mkdir -p dist
+          lipo -create -output dist/mdblaze \
+            target/aarch64-apple-darwin/release/mdblaze \
+            target/x86_64-apple-darwin/release/mdblaze
+          lipo -info dist/mdblaze
+
+      # Built by the program itself, so the `Info.plist` in a signed release and
+      # the one `--install-handler` writes come out of the same tested function
+      # and cannot drift. The binary is universal, so it runs here whatever this
+      # runner turns out to be.
+      - name: the application bundle
+        run: ./dist/mdblaze --bundle dist/mdblaze.app
+
+      - name: are there signing credentials?
+        id: creds
+        env:
+          CERT: ${{ secrets.APPLE_CERT_P12 }}
+        run: |
+          if [ -n "$CERT" ]; then
+            echo "have=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::APPLE_CERT_P12 is not set; the macOS build will be unsigned and macOS will quarantine it"
+            echo "have=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: a keychain holding the certificate
+        if: steps.creds.outputs.have == 'true'
+        env:
+          CERT: ${{ secrets.APPLE_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          set -eu
+          # A keychain belonging to this run, with a password nobody chose,
+          # deleted when the job ends. Importing into the login keychain would
+          # leave a Developer ID certificate sitting on a shared runner image.
+          pw=$(openssl rand -base64 24)
+          echo "::add-mask::$pw"
+          echo "KEYCHAIN_PASSWORD=$pw" >> "$GITHUB_ENV"
+          security create-keychain -p "$pw" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$pw" build.keychain
+          # A timeout long enough to outlast notarization. The default relocks
+          # the keychain after five minutes, and Apple can take longer than that
+          # -- at which point signing fails for a reason that looks like nothing
+          # to do with time.
+          security set-keychain-settings -t 3600 -u build.keychain
+          printf '%s' "$CERT" | base64 --decode > cert.p12
+          security import cert.p12 -k build.keychain -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm -f cert.p12
+          # Without this, every `codesign` stops for a GUI password prompt that
+          # nobody is there to answer, and the job hangs until it times out.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$pw" build.keychain
+          security find-identity -v -p codesigning build.keychain
+
+      - name: sign the application
+        if: steps.creds.outputs.have == 'true'
+        env:
+          IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -eu
+          # `--options runtime` turns on the hardened runtime, which notarization
+          # refuses a submission without. `--timestamp` records a trusted
+          # timestamp so the signature stays valid after the certificate itself
+          # expires -- without it, every release ever published stops verifying
+          # on the day the certificate lapses.
+          codesign --force --options runtime --timestamp --sign "$IDENTITY" dist/mdblaze.app
+          codesign --verify --strict --verbose=2 dist/mdblaze.app
+
+      # Taken back OUT of the signed bundle rather than signed separately, so the
+      # binary in the tarball is byte-for-byte the one that was notarized.
+      - name: the signed binary, for the tarball
+        run: cp dist/mdblaze.app/Contents/MacOS/mdblaze dist/mdblaze
+
+      - name: the disk image
+        run: |
+          set -eu
+          mkdir -p dmg
+          cp -R dist/mdblaze.app dmg/
+          # The Applications symlink is the whole ceremony of installing a Mac
+          # application: open, drag left to right, done.
+          ln -s /Applications dmg/Applications
+          hdiutil create -volname mdblaze -srcfolder dmg -ov -format UDZO dist/mdblaze-macos.dmg
+
+      - name: notarize and staple
+        if: steps.creds.outputs.have == 'true'
+        env:
+          IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          KEY: ${{ secrets.APPLE_API_KEY_P8 }}
+          KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -eu
+          codesign --force --timestamp --sign "$IDENTITY" dist/mdblaze-macos.dmg
+          printf '%s' "$KEY" | base64 --decode > key.p8
+          xcrun notarytool submit dist/mdblaze-macos.dmg \
+            --key key.p8 --key-id "$KEY_ID" --issuer "$ISSUER" --wait --timeout 30m
+          rm -f key.p8
+          # Staple the ticket INTO the image, so Gatekeeper approves it with no
+          # network at all. Only a bundle, a disk image or an installer can be
+          # stapled -- a bare executable cannot -- and that is the practical
+          # reason a .dmg is what this ships rather than only a tarball.
+          xcrun stapler staple dist/mdblaze-macos.dmg
+          xcrun stapler validate dist/mdblaze-macos.dmg
+
+      - name: package
+        run: |
+          set -eu
+          out=mdblaze-macos-universal
+          mkdir -p "dist/$out"
+          cp dist/mdblaze "dist/$out/"
+          cp README.md NOTICE LICENSE-MIT LICENSE-APACHE "dist/$out/"
+          cp assets/fonts/LICENSE-Noto.txt "dist/$out/"
+          cd dist && tar czf "$out.tar.gz" "$out"
+
+      # `always()`, so a failed notarization does not leave a Developer ID
+      # certificate unlocked in a keychain on the runner.
+      - name: take the keychain away
+        if: always() && steps.creds.outputs.have == 'true'
+        run: security delete-keychain build.keychain || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: |
+            dist/*.tar.gz
+            dist/*.dmg
+          if-no-files-found: error
+
   release:
-    needs: build
+    needs: [build, macos]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -183,7 +386,7 @@ jobs:
       - name: checksums
         run: |
           cd dist
-          sha256sum *.tar.gz *.zip > SHA256SUMS
+          sha256sum *.tar.gz *.zip *.dmg > SHA256SUMS
           cat SHA256SUMS
 
       # What a checksum file cannot do on its own: say who made it.
@@ -204,6 +407,7 @@ jobs:
           subject-path: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*.dmg
 
       # A detached OpenPGP signature over the checksum file, for the platform
       # with no notion of a trusted publisher at all. Linux has no Gatekeeper to
@@ -257,7 +461,7 @@ jobs:
           # only there when a key was configured, and a second `gh release
           # create` behind an `||` would also fire on failures that have nothing
           # to do with a missing file.
-          assets=(dist/*.tar.gz dist/*.zip dist/SHA256SUMS)
+          assets=(dist/*.tar.gz dist/*.zip dist/*.dmg dist/SHA256SUMS)
           if [ -f dist/SHA256SUMS.asc ]; then assets+=(dist/SHA256SUMS.asc); fi
           printf 'releasing %s\n' "${assets[@]}"
           gh release create "${GITHUB_REF#refs/tags/}" \
