@@ -792,6 +792,30 @@ fn main() {
             // opens this. Separated from opening a file because it changes the
             // machine rather than the document, and because taking over a file
             // type should be something a person asked for by name.
+            // Write a self-contained `.app` and stop. What a macOS RELEASE is
+            // built from: the bundle carries a copy of this program, so it can
+            // be signed and notarized as one thing and handed to somebody who
+            // has never heard of cargo.
+            //
+            // Distinct from `--install-handler`, which writes a bundle pointing
+            // AT this binary so upgrading in place keeps working. That one is
+            // right on the machine it was run on and useless anywhere else.
+            #[cfg(unix)]
+            "--bundle" => {
+                let Some(dir) = args.next() else {
+                    eprintln!("mdblaze: --bundle needs a path, e.g. --bundle dist/mdblaze.app");
+                    std::process::exit(2);
+                };
+                let exe = std::env::current_exe().expect("this program's own path");
+                match desktop::macos::bundle(std::path::Path::new(&dir), &exe) {
+                    Ok(()) => println!("  wrote {dir}"),
+                    Err(e) => {
+                        eprintln!("mdblaze: {dir}: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
             "--install-handler" => {
                 report(desktop::install());
                 return;
@@ -803,6 +827,7 @@ fn main() {
             "-h" | "--help" => {
                 println!(
                     "mdblaze [--timing] [--once] [--shot out.ppm [--at B] [--select A:B]] <file.md>\n\
+                     mdblaze --bundle out.app      build a self-contained macOS .app\n\
                      mdblaze --install-handler     open .md files by double-click\n\
                      mdblaze --uninstall-handler   and give the association back"
                 );
