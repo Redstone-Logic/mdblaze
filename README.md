@@ -200,10 +200,34 @@ Each archive carries the licences with it, because the Noto faces compiled into
 the binary are under the SIL Open Font License and that text has to travel with
 any copy. See [NOTICE](NOTICE).
 
+Cutting a release is a tag and a push:
+
+```sh
+git tag -a v0.2.1 -m "what changed"
+git push origin v0.2.1
+```
+
+That one push runs the whole thing, in an order chosen so that everything able
+to say *don't release this* says it before anything is published:
+
+1. the tag agrees with `Cargo.toml`, and the packaged crate compiles — so a bad
+   `exclude` list is caught here rather than after the release is public
+2. the tests, on Linux, macOS and Windows, **on the commit being tagged**
+3. the four binaries
+4. the GitHub release
+5. crates.io — last, because it is the only step that cannot be undone
+
+Publishing uses a `CARGO_REGISTRY_TOKEN` repository secret, scoped on crates.io
+to `publish-update` on this crate alone. It is read by one step, which runs no
+third-party code: `cargo publish` normally verifies by *building*, and a build
+executes the build scripts and proc macros of every dependency. The tarball was
+already built and proven in step 1, so the publishing step passes `--no-verify`
+and the token never enters a build environment.
+
 ## Building
 
 ```sh
-cargo test                                                  # 250 tests
+cargo test                                                  # 287 tests
 cargo check --target aarch64-apple-darwin  --all-targets
 cargo check --target x86_64-pc-windows-msvc --all-targets
 ```
